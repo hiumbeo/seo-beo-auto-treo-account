@@ -61,7 +61,7 @@ export function ExportBotTab() {
             <div className="text-slate-400 font-sans font-medium mb-2">Thông số Web Service trên Render</div>
             <div className="flex justify-between gap-2">
               <span className="text-slate-400">Build Command:</span>
-              <span className="text-emerald-400">npm install --include=dev && npm run build</span>
+              <span className="text-emerald-400">npm install --include=dev --legacy-peer-deps && npm run build</span>
             </div>
             <div className="flex justify-between gap-2">
               <span className="text-slate-400">Start Command:</span>

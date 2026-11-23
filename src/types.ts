@@ -31,6 +31,8 @@ export interface ActivityConfig {
   autoJoinVoice: boolean;
   autoStreamImage: boolean;
   streamImageDataUrl: string;
+  enableChatCommands: boolean;
+  commandPrefix: string;
 }
 
 export interface RobloxLivePresence {

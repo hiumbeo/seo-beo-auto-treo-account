@@ -6,6 +6,7 @@ import {
   Radio,
   RefreshCw,
   RotateCcw,
+  Terminal,
   Upload,
   Volume2,
   VolumeX,
@@ -548,6 +549,67 @@ export function VoiceStreamTab({
               </span>
             </div>
           </div>
+        </div>
+      </div>
+
+      <div className="lg:col-span-12 bg-[#111622] border border-[#232C3F] rounded-lg overflow-hidden">
+        <div className="px-5 py-4 border-b border-[#232C3F] flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-2.5">
+            <Terminal className="w-4 h-4 text-[#5865F2]" />
+            <div>
+              <h2 className="text-base font-semibold text-white">
+                Lệnh Chat Self-Bot Trên Discord ({state.config.commandPrefix || '.'}help)
+              </h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Gõ lệnh trực tiếp bằng tài khoản của bạn ở bất kỳ kênh chat hoặc DM nào (chỉ nhận lệnh từ chính chủ tài khoản).
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-400">Prefix</span>
+              <input
+                type="text"
+                maxLength={4}
+                value={state.config.commandPrefix || '.'}
+                onChange={(e) => onUpdateConfig({ commandPrefix: e.target.value || '.' })}
+                className="w-14 bg-[#090C12] border border-[#232C3F] focus:border-[#5865F2] rounded-md px-2 py-1 text-center text-xs font-mono text-white outline-none"
+              />
+            </div>
+
+            <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-200 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={state.config.enableChatCommands}
+                onChange={(e) => onUpdateConfig({ enableChatCommands: e.target.checked })}
+                className="w-4 h-4 accent-[#5865F2]"
+              />
+              Bật lệnh chat
+            </label>
+          </div>
+        </div>
+
+        <div className="p-5 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
+          {[
+            { cmd: `${state.config.commandPrefix || '.'}help`, desc: 'Hiện bảng danh sách toàn bộ lệnh self-bot' },
+            { cmd: `${state.config.commandPrefix || '.'}join [channel_id]`, desc: 'Vào kênh thoại (bỏ trống = kênh đã lưu hoặc kênh đầu server)' },
+            { cmd: `${state.config.commandPrefix || '.'}leave`, desc: 'Rời kênh thoại và tắt stream' },
+            { cmd: `${state.config.commandPrefix || '.'}stream [channel_id]`, desc: 'Vào voice và phát Go Live Stream Ảnh Tĩnh' },
+            { cmd: `${state.config.commandPrefix || '.'}stopstream`, desc: 'Tắt Go Live Stream Ảnh (vẫn ở trong voice)' },
+            { cmd: `${state.config.commandPrefix || '.'}mute / ${state.config.commandPrefix || '.'}deaf`, desc: 'Bật/tắt mic & loa khi đang treo voice (kèm unmute/undeaf)' },
+            { cmd: `${state.config.commandPrefix || '.'}roblox`, desc: 'Đưa Game Activity về Roblox chính hãng ngay lập tức' },
+            { cmd: `${state.config.commandPrefix || '.'}game <tên hoặc ID>`, desc: 'Đổi sang bất kỳ game nào trong Discord Detectable' },
+            { cmd: `${state.config.commandPrefix || '.'}ping / ${state.config.commandPrefix || '.'}streak`, desc: 'Xem ping Gateway, Voice/Stream & chuỗi ngày thật' },
+          ].map((item) => (
+            <div
+              key={item.cmd}
+              className="p-3 bg-[#090C12] border border-[#1E2638] rounded-md space-y-1"
+            >
+              <div className="font-mono font-semibold text-[#818CF8]">{item.cmd}</div>
+              <div className="text-slate-400 leading-relaxed">{item.desc}</div>
+            </div>
+          ))}
         </div>
       </div>
     </div>

@@ -43,6 +43,8 @@ export interface ActivityConfig {
   autoJoinVoice: boolean;
   autoStreamImage: boolean;
   streamImageDataUrl: string;
+  enableChatCommands: boolean;
+  commandPrefix: string;
 }
 
 export interface RobloxAccountPublic {
@@ -217,6 +219,8 @@ export const ROBLOX_PRESET: ActivityConfig = {
   autoJoinVoice: false,
   autoStreamImage: false,
   streamImageDataUrl: '',
+  enableChatCommands: true,
+  commandPrefix: '.',
 };
 
 function buildSuperPropertiesObj() {
@@ -400,6 +404,9 @@ export class DiscordSelfBotManager extends EventEmitter {
       }
       if (process.env.AUTO_STREAM_IMAGE === 'true') {
         this.config.autoStreamImage = true;
+      }
+      if (process.env.COMMAND_PREFIX?.trim()) {
+        this.config.commandPrefix = process.env.COMMAND_PREFIX.trim().slice(0, 5);
       }
       this.config.platform = 'desktop';
 
@@ -1104,6 +1111,10 @@ export class DiscordSelfBotManager extends EventEmitter {
       this.closeStreamWs();
       this.addLog('info', 'Stream', `Đã tắt Go Live${sd.reason ? ` (${sd.reason})` : ''}.`);
       this.emitUpdate();
+    } else if (eventName === 'MESSAGE_CREATE') {
+      this.handleChatCommand(data).catch((err) => {
+        this.addLog('warn', 'Command', `Lỗi xử lý lệnh chat: ${err instanceof Error ? err.message : String(err)}`);
+      });
     }
   }
 
@@ -2097,6 +2108,278 @@ export class DiscordSelfBotManager extends EventEmitter {
     } else {
       const errText = await res.text().catch(() => '');
       this.addLog('warn', 'Stream', `Cập nhật ảnh preview stream (${res.status}): ${errText.slice(0, 100)}`);
+    }
+  }
+
+  private async sendChannelReply(channelId: string, content: string) {
+    if (!this.token || !channelId) return;
+    await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ content }),
+    }).catch(() => {});
+  }
+
+  private async resolveChannelInfo(
+    channelId: string
+  ): Promise<{ id: string; guild_id?: string; name?: string; type?: number } | null> {
+    if (!this.token || !channelId) return null;
+    const res = await fetch(`${DISCORD_API_BASE}/channels/${channelId}`, {
+      method: 'GET',
+      headers: this.getHeaders(),
+    }).catch(() => null);
+    if (!res || !res.ok) return null;
+    return (await res.json()) as { id: string; guild_id?: string; name?: string; type?: number };
+  }
+
+  private async handleChatCommand(raw: unknown) {
+    if (!this.config.enableChatCommands) return;
+    const msg = raw as {
+      id?: string;
+      channel_id?: string;
+      guild_id?: string;
+      content?: string;
+      author?: { id?: string; username?: string };
+    };
+    if (!msg?.channel_id || !msg?.content || !msg?.author?.id) return;
+    // Strictly only execute commands from the self-bot owner's own account
+    if (!this.user?.id || msg.author.id !== this.user.id) return;
+
+    const prefix = (this.config.commandPrefix || '.').trim() || '.';
+    const trimmed = msg.content.trim();
+    if (!trimmed.startsWith(prefix)) return;
+
+    const body = trimmed.slice(prefix.length).trim();
+    if (!body) return;
+    const parts = body.split(/\s+/);
+    const cmd = parts[0].toLowerCase();
+    const args = parts.slice(1);
+    const channelId = msg.channel_id;
+
+    if (cmd === 'help' || cmd === 'menu' || cmd === 'cmds') {
+      const helpText = [
+        '```ini',
+        '[ ROBLOX ACTIVITY & VOICE SELF-BOT (PC) ]',
+        `${prefix}help                  - Xem danh sách lệnh`,
+        `${prefix}ping                  - Kiểm tra Gateway, Voice & Stream`,
+        `${prefix}join [channel_id]     - Vào kênh thoại (bỏ trống = kênh mặc định / đầu server)`,
+        `${prefix}leave                 - Rời kênh thoại`,
+        `${prefix}stream [channel_id]   - Vào voice và bật Go Live Stream Ảnh`,
+        `${prefix}stopstream            - Tắt Go Live Stream Ảnh`,
+        `${prefix}mute / ${prefix}unmute       - Tắt / Bật mic khi đang treo voice`,
+        `${prefix}deaf / ${prefix}undeaf       - Tắt / Bật loa khi đang treo voice`,
+        `${prefix}roblox                - Chuyển Activity về Roblox chính hãng`,
+        `${prefix}game <tên hoặc ID>    - Đổi Game Activity đang chơi`,
+        `${prefix}status <online|idle|dnd|invisible> - Đổi trạng thái PC`,
+        `${prefix}streak                - Xem chuỗi ngày chơi game thật trên Discord`,
+        '```',
+      ].join('\n');
+      this.addLog('info', 'Command', `Đã thực thi ${prefix}${cmd}`);
+      await this.sendChannelReply(channelId, helpText);
+      return;
+    }
+
+    if (cmd === 'ping' || cmd === 'info') {
+      const voiceLine = this.voiceConnected
+        ? `Connected (Kênh ${this.config.voiceChannelId})`
+        : 'Offline';
+      const streamLine = this.streamActive
+        ? `LIVE Ảnh (${this.streamKey})`
+        : 'Đang tắt';
+      const infoText = [
+        '```yaml',
+        `Ping Gateway : ${this.pingMs ?? '--'} ms`,
+        `Client       : PC Discord Desktop Windows`,
+        `Activity     : ${this.activityActive ? `${this.config.gameName} (${this.config.applicationId})` : 'Đang tắt'}`,
+        `Voice        : ${voiceLine}`,
+        `Stream Ảnh   : ${streamLine}`,
+        '```',
+      ].join('\n');
+      this.addLog('info', 'Command', `Đã thực thi ${prefix}${cmd}`);
+      await this.sendChannelReply(channelId, infoText);
+      return;
+    }
+
+    if (cmd === 'join' || cmd === 'vc' || cmd === 'voice') {
+      let targetChannelId = (args[0] || '').replace(/[<#>]/g, '').trim();
+      let targetGuildId = msg.guild_id || this.config.voiceGuildId;
+
+      if (targetChannelId) {
+        const chInfo = await this.resolveChannelInfo(targetChannelId);
+        if (chInfo?.guild_id) {
+          targetGuildId = chInfo.guild_id;
+        }
+      } else if (this.config.voiceGuildId && this.config.voiceChannelId) {
+        targetGuildId = this.config.voiceGuildId;
+        targetChannelId = this.config.voiceChannelId;
+      } else if (msg.guild_id) {
+        const channels = await this.fetchGuildVoiceChannels(msg.guild_id).catch(() => []);
+        if (channels.length > 0) {
+          targetGuildId = msg.guild_id;
+          targetChannelId = channels[0].id;
+        }
+      }
+
+      if (!targetGuildId || !targetChannelId) {
+        await this.sendChannelReply(
+          channelId,
+          `Không tìm thấy kênh thoại. Hãy dùng \`${prefix}join <Voice_Channel_ID>\`.`
+        );
+        return;
+      }
+
+      this.joinVoice({
+        guildId: targetGuildId,
+        channelId: targetChannelId,
+        selfMute: this.config.voiceSelfMute,
+        selfDeaf: this.config.voiceSelfDeaf,
+      });
+      this.addLog('success', 'Command', `${prefix}${cmd} -> Vào voice ${targetChannelId}`);
+      await this.sendChannelReply(channelId, `Đã vào kênh thoại <#${targetChannelId}> (\`${targetChannelId}\`).`);
+      return;
+    }
+
+    if (cmd === 'leave' || cmd === 'dc' || cmd === 'out') {
+      this.leaveVoice();
+      this.addLog('info', 'Command', `${prefix}${cmd} -> Rời kênh thoại`);
+      await this.sendChannelReply(channelId, 'Đã rời kênh thoại và tắt stream.');
+      return;
+    }
+
+    if (cmd === 'stream' || cmd === 'live') {
+      let targetChannelId = (args[0] || '').replace(/[<#>]/g, '').trim();
+      let targetGuildId = msg.guild_id || this.config.voiceGuildId;
+
+      if (targetChannelId) {
+        const chInfo = await this.resolveChannelInfo(targetChannelId);
+        if (chInfo?.guild_id) {
+          targetGuildId = chInfo.guild_id;
+        }
+        this.config.voiceGuildId = targetGuildId;
+        this.config.voiceChannelId = targetChannelId;
+      } else if (!this.config.voiceChannelId && msg.guild_id) {
+        const channels = await this.fetchGuildVoiceChannels(msg.guild_id).catch(() => []);
+        if (channels.length > 0) {
+          this.config.voiceGuildId = msg.guild_id;
+          this.config.voiceChannelId = channels[0].id;
+        }
+      }
+
+      if (!this.config.voiceGuildId || !this.config.voiceChannelId) {
+        await this.sendChannelReply(
+          channelId,
+          `Chưa chọn kênh thoại. Dùng \`${prefix}stream <Voice_Channel_ID>\` hoặc vào voice trước.`
+        );
+        return;
+      }
+
+      this.startStreamImage();
+      this.addLog('success', 'Command', `${prefix}${cmd} -> Bật Go Live Stream Ảnh`);
+      await this.sendChannelReply(
+        channelId,
+        `Đang phát Go Live Stream Ảnh tại <#${this.config.voiceChannelId}>.`
+      );
+      return;
+    }
+
+    if (cmd === 'stopstream' || cmd === 'unstream' || cmd === 'endlive') {
+      this.stopStreamImage();
+      this.addLog('info', 'Command', `${prefix}${cmd} -> Dừng stream`);
+      await this.sendChannelReply(channelId, 'Đã tắt Go Live Stream Ảnh.');
+      return;
+    }
+
+    if (cmd === 'mute' || cmd === 'unmute' || cmd === 'deaf' || cmd === 'undeaf') {
+      if (cmd === 'mute') this.config.voiceSelfMute = true;
+      if (cmd === 'unmute') this.config.voiceSelfMute = false;
+      if (cmd === 'deaf') this.config.voiceSelfDeaf = true;
+      if (cmd === 'undeaf') this.config.voiceSelfDeaf = false;
+      this.persistState();
+      if (this.voiceConnected && this.config.voiceGuildId && this.config.voiceChannelId) {
+        this.joinVoice({
+          guildId: this.config.voiceGuildId,
+          channelId: this.config.voiceChannelId,
+          selfMute: this.config.voiceSelfMute,
+          selfDeaf: this.config.voiceSelfDeaf,
+        });
+      }
+      this.emitUpdate();
+      await this.sendChannelReply(
+        channelId,
+        `Voice: Mic=${this.config.voiceSelfMute ? 'Tắt' : 'Bật'}, Loa=${this.config.voiceSelfDeaf ? 'Tắt' : 'Bật'}.`
+      );
+      return;
+    }
+
+    if (cmd === 'roblox') {
+      this.updateConfig({
+        applicationId: ROBLOX_PRESET.applicationId,
+        gameName: ROBLOX_PRESET.gameName,
+        executableName: ROBLOX_PRESET.executableName,
+        iconHash: ROBLOX_PRESET.iconHash,
+      });
+      if (!this.activityActive) {
+        this.activityActive = true;
+        this.activityStartedAt = Date.now();
+        this.sendPresenceUpdate();
+      }
+      this.addLog('success', 'Command', `${prefix}roblox -> Đặt lại Roblox chính hãng`);
+      await this.sendChannelReply(channelId, 'Đã bật Activity **Roblox** (PC Desktop).');
+      return;
+    }
+
+    if (cmd === 'game' && args.length > 0) {
+      const q = args.join(' ').trim();
+      const matches = await this.getDetectableGames(q);
+      if (matches.length === 0) {
+        await this.sendChannelReply(channelId, `Không tìm thấy game \`${q}\` trong Discord Detectable.`);
+        return;
+      }
+      const picked = matches[0];
+      const exe =
+        picked.executables?.find((e) => e.os === 'win32')?.name ||
+        picked.executables?.[0]?.name ||
+        `${picked.name}.exe`;
+      this.updateConfig({
+        applicationId: picked.id,
+        gameName: picked.name,
+        executableName: exe,
+        iconHash: picked.icon_hash || picked.icon || '',
+      });
+      if (!this.activityActive) {
+        this.activityActive = true;
+        this.activityStartedAt = Date.now();
+        this.sendPresenceUpdate();
+      }
+      this.addLog('success', 'Command', `${prefix}game -> ${picked.name}`);
+      await this.sendChannelReply(channelId, `Đã đổi Activity sang **${picked.name}** (\`${picked.id}\`).`);
+      return;
+    }
+
+    if (cmd === 'status' && args[0]) {
+      const nextStatus = args[0].toLowerCase() as DiscordStatus;
+      if (!['online', 'idle', 'dnd', 'invisible'].includes(nextStatus)) {
+        await this.sendChannelReply(channelId, 'Trạng thái hợp lệ: `online`, `idle`, `dnd`, `invisible`.');
+        return;
+      }
+      this.updateConfig({ status: nextStatus });
+      this.addLog('info', 'Command', `${prefix}status -> ${nextStatus}`);
+      await this.sendChannelReply(channelId, `Đã đổi trạng thái PC sang \`${nextStatus}\`.`);
+      return;
+    }
+
+    if (cmd === 'streak') {
+      const entries = await this.fetchContentInventory();
+      if (entries.length === 0) {
+        await this.sendChannelReply(channelId, 'Chưa có dữ liệu chuỗi game nào trong Content Inventory.');
+        return;
+      }
+      const lines = entries.slice(0, 6).map((e) => {
+        const mins = Math.floor(e.durationSeconds / 60);
+        return `• ${e.gameName}: chuỗi ${e.streakDays} ngày (${mins} phút)`;
+      });
+      await this.sendChannelReply(channelId, `**Chuỗi Game Discord Hiện Tại:**\n${lines.join('\n')}`);
+      return;
     }
   }
 
