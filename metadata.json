@@ -1,0 +1,6 @@
+{
+  "name": "Discord Roblox Activity & Streak Self-Bot",
+  "description": "Self-bot điều khiển Discord Gateway v10, tự động chạy hoạt động Roblox real, giữ chuỗi chơi game và cày Quest heartbeat trực tiếp.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

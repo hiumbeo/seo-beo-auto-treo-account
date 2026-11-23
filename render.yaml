@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: discord-roblox-selfbot
+    runtime: node
+    plan: free
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: 22.20.0
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: AUTO_START
+        value: "true"
+      - key: VOICE_GUILD_ID
+        sync: false
+      - key: VOICE_CHANNEL_ID
+        sync: false
+      - key: AUTO_JOIN_VOICE
+        value: "false"
+      - key: AUTO_STREAM_IMAGE
+        value: "false"
