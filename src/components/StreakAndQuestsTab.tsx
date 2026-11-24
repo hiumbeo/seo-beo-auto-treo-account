@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { Award, Flame, Play, RefreshCw } from 'lucide-react';
-import type { DiscordQuestItem, InventoryGameEntry } from '../types';
+import { Award, Flame, Globe, Play, RefreshCw, Square, Zap } from 'lucide-react';
+import type { DiscordQuestItem, InventoryGameEntry, QuestRunnerPublicState } from '../types';
 
 interface StreakAndQuestsTabProps {
   hasToken: boolean;
@@ -9,10 +9,24 @@ interface StreakAndQuestsTabProps {
   quests: DiscordQuestItem[];
   lastQuestSyncAt: string | null;
   activeAppId: string;
+  questRunner: QuestRunnerPublicState;
+  questBoostRatio: number;
+  questAutoBackToVN: boolean;
   onSyncStreak: () => Promise<void>;
   onSyncQuests: () => Promise<void>;
   onEnrollQuest: (questId: string) => Promise<void>;
   onSendQuestHeartbeat: (questId: string, applicationId: string) => Promise<void>;
+  onRunAutoQuests: (opts: {
+    boostRatio: number;
+    sweepRegions: boolean;
+    autoBackToVN: boolean;
+  }) => Promise<void>;
+  onStopAutoQuests: () => Promise<void>;
+  onSweepQuestRegions: (autoBackToVN: boolean) => Promise<void>;
+  onUpdateQuestConfig: (partial: {
+    questBoostRatio?: number;
+    questAutoBackToVN?: boolean;
+  }) => Promise<void>;
 }
 
 function formatDuration(sec: number): string {
@@ -23,6 +37,8 @@ function formatDuration(sec: number): string {
   return `${mins} phút`;
 }
 
+const BOOST_OPTIONS = [1, 2.5, 5, 8];
+
 export function StreakAndQuestsTab({
   hasToken,
   inventoryEntries,
@@ -30,14 +46,23 @@ export function StreakAndQuestsTab({
   quests,
   lastQuestSyncAt,
   activeAppId,
+  questRunner,
+  questBoostRatio,
+  questAutoBackToVN,
   onSyncStreak,
   onSyncQuests,
   onEnrollQuest,
   onSendQuestHeartbeat,
+  onRunAutoQuests,
+  onStopAutoQuests,
+  onSweepQuestRegions,
+  onUpdateQuestConfig,
 }: StreakAndQuestsTabProps) {
   const [syncingInv, setSyncingInv] = useState(false);
   const [syncingQuests, setSyncingQuests] = useState(false);
   const [busyQuestId, setBusyQuestId] = useState<string | null>(null);
+  const [boostRatio, setBoostRatio] = useState<number>(questBoostRatio || 2.5);
+  const [autoBackToVN, setAutoBackToVN] = useState<boolean>(questAutoBackToVN ?? true);
 
   const handleSyncInventory = async () => {
     setSyncingInv(true);
@@ -56,6 +81,8 @@ export function StreakAndQuestsTab({
       setSyncingQuests(false);
     }
   };
+
+  const isRunnerBusy = questRunner.running || questRunner.sweeping;
 
   return (
     <div className="space-y-6">
@@ -150,10 +177,14 @@ export function StreakAndQuestsTab({
         <div className="px-5 py-4 border-b border-[#232C3F] flex flex-wrap items-center justify-between gap-4">
           <div>
             <h2 className="text-base font-semibold text-white">
-              Discord Quests & Auto Heartbeat
+              Discord Auto Quest Engine (Video + Game + Quét 40 Quốc Gia)
             </h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              Tự động gửi nhịp tim <span className="font-mono">POST /quests/{'{id}'}/heartbeat</span> để cày tiến độ Quest thật ·{' '}
+              Hỗ trợ đủ 5 loại: <span className="font-mono">WATCH_VIDEO</span>,{' '}
+              <span className="font-mono">WATCH_VIDEO_ON_MOBILE</span>,{' '}
+              <span className="font-mono">PLAY_ON_DESKTOP</span>,{' '}
+              <span className="font-mono">STREAM_ON_DESKTOP</span>,{' '}
+              <span className="font-mono">PLAY_ACTIVITY</span> ·{' '}
               {lastQuestSyncAt
                 ? `Đồng bộ lúc ${new Date(lastQuestSyncAt).toLocaleTimeString('vi-VN')}`
                 : 'Chưa tải'}
@@ -170,6 +201,103 @@ export function StreakAndQuestsTab({
           </button>
         </div>
 
+        <div className="px-5 py-4 bg-[#0C1019] border-b border-[#232C3F] space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="text-xs text-slate-400">
+                Trạng thái Auto Quest · Vùng hiện tại:{' '}
+                <span className="font-mono text-white">{questRunner.currentRegion}</span>
+              </div>
+              <div
+                className={`text-sm font-medium ${
+                  isRunnerBusy ? 'text-amber-400' : 'text-slate-200'
+                }`}
+              >
+                {questRunner.statusMessage}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {isRunnerBusy ? (
+                <button
+                  type="button"
+                  onClick={onStopAutoQuests}
+                  className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-500 text-white rounded-md transition-colors whitespace-nowrap"
+                >
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                  Dừng Auto Quest
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    disabled={!hasToken}
+                    onClick={() => onSweepQuestRegions(autoBackToVN)}
+                    className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium bg-[#182032] hover:bg-[#222D45] border border-[#2C374F] disabled:opacity-40 text-white rounded-md transition-colors whitespace-nowrap"
+                  >
+                    <Globe className="w-3.5 h-3.5 text-[#818CF8]" />
+                    Quét Quest Toàn Cầu (40 nước)
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!hasToken}
+                    onClick={() =>
+                      onRunAutoQuests({
+                        boostRatio,
+                        sweepRegions: false,
+                        autoBackToVN,
+                      })
+                    }
+                    className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold bg-[#5865F2] hover:bg-[#4752C4] disabled:opacity-40 text-white rounded-md transition-colors whitespace-nowrap"
+                  >
+                    <Zap className="w-3.5 h-3.5" />
+                    Chạy Auto Tất Cả Quest
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-4 pt-3 border-t border-[#1C2436]">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-slate-400 mr-1">Tốc độ Boost:</span>
+              <div className="inline-flex items-center gap-1 p-1 bg-[#111622] border border-[#232C3F] rounded-md">
+                {BOOST_OPTIONS.map((opt) => (
+                  <button
+                    key={opt}
+                    type="button"
+                    onClick={() => {
+                      setBoostRatio(opt);
+                      onUpdateQuestConfig({ questBoostRatio: opt });
+                    }}
+                    className={`px-2.5 py-1 text-xs font-mono tabular-nums rounded transition-colors ${
+                      boostRatio === opt
+                        ? 'bg-[#5865F2] text-white font-semibold'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {opt}x
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <label className="inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoBackToVN}
+                onChange={(e) => {
+                  const val = e.target.checked;
+                  setAutoBackToVN(val);
+                  onUpdateQuestConfig({ questAutoBackToVN: val });
+                }}
+                className="w-4 h-4 accent-[#5865F2]"
+              />
+              <span>Tự động đưa tài khoản về vùng Việt Nam (VN) sau khi quét</span>
+            </label>
+          </div>
+        </div>
+
         {quests.length === 0 ? (
           <div className="p-8 text-center">
             <Award className="w-8 h-8 text-slate-500 mx-auto mb-2.5" />
@@ -177,7 +305,7 @@ export function StreakAndQuestsTab({
               Hiện chưa có Quest nào hoặc chưa đồng bộ tài khoản
             </p>
             <p className="text-xs text-slate-500 mt-1">
-              Bấm "Tải danh sách Quest" sau khi xác thực token để xem các nhiệm vụ Discord hiện có trên tài khoản.
+              Bấm "Tải danh sách Quest" hoặc "Quét Quest Toàn Cầu (40 nước)" để săn thêm Quest ẩn theo khu vực.
             </p>
           </div>
         ) : (

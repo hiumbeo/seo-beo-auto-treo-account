@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   AlertCircle,
+  Award,
   Code2,
   Eye,
   EyeOff,
@@ -24,17 +25,19 @@ import { RobloxAccountTab } from './components/RobloxAccountTab';
 import { GameCatalogTab } from './components/GameCatalogTab';
 import { StreakAndQuestsTab } from './components/StreakAndQuestsTab';
 import { VoiceStreamTab } from './components/VoiceStreamTab';
+import { BadgeSpoofTab } from './components/BadgeSpoofTab';
 import { LogsTab } from './components/LogsTab';
 import { ExportBotTab } from './components/ExportBotTab';
 
-type NavTab = 'overview' | 'roblox' | 'games' | 'voice' | 'streak' | 'logs' | 'export';
+type NavTab = 'overview' | 'roblox' | 'games' | 'voice' | 'streak' | 'badge' | 'logs' | 'export';
 
 const NAV_ITEMS: Array<{ id: NavTab; label: string; icon: typeof LayoutDashboard }> = [
   { id: 'overview', label: 'Bảng điều khiển', icon: LayoutDashboard },
   { id: 'roblox', label: 'Tài khoản Roblox', icon: UserCheck },
   { id: 'games', label: 'Kho Game & RPC', icon: Gamepad2 },
   { id: 'voice', label: 'Voice & Stream Ảnh', icon: Volume2 },
-  { id: 'streak', label: 'Chuỗi & Nhiệm vụ', icon: Flame },
+  { id: 'streak', label: 'Chuỗi & Auto Quest', icon: Flame },
+  { id: 'badge', label: 'Farm Badge & Giờ Chơi', icon: Award },
   { id: 'logs', label: 'Nhật ký Gateway', icon: Terminal },
   { id: 'export', label: 'Host Render & Export', icon: Code2 },
 ];
@@ -260,6 +263,82 @@ export default function App() {
       return;
     }
     setState(json.state);
+  };
+
+  const handleRunAutoQuests = async (opts: {
+    boostRatio: number;
+    sweepRegions: boolean;
+    autoBackToVN: boolean;
+  }) => {
+    setErrorMsg(null);
+    const res = await fetch('/api/quests/auto-run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts),
+    });
+    const json = await res.json();
+    if (!res.ok || !json.ok) {
+      setErrorMsg(json.error || 'Không thể chạy Auto Quest.');
+      return;
+    }
+    setState(json.state);
+    notify(`Đang chạy Auto Quest (boost x${opts.boostRatio}).`);
+  };
+
+  const handleStopAutoQuests = async () => {
+    const res = await fetch('/api/quests/auto-stop', { method: 'POST' });
+    const json = await res.json();
+    if (json.ok) {
+      setState(json.state);
+      notify('Đã dừng Auto Quest.');
+    }
+  };
+
+  const handleSweepQuestRegions = async (autoBackToVN: boolean) => {
+    setErrorMsg(null);
+    const res = await fetch('/api/quests/sweep', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ autoBackToVN }),
+    });
+    const json = await res.json();
+    if (!res.ok || !json.ok) {
+      setErrorMsg(json.error || 'Không thể quét Quest toàn cầu.');
+      return;
+    }
+    setState(json.state);
+    notify('Đang quét Quest qua 40 khu vực toàn cầu.');
+  };
+
+  const handleStartBadgeSpoof = async (params: {
+    mode: 'played_count' | 'playtime_hours';
+    gameLimit: number;
+    hoursPerGame?: number;
+    cookie?: string;
+    fingerprint?: string;
+  }) => {
+    setErrorMsg(null);
+    const res = await fetch('/api/badge/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const json = await res.json();
+    if (!res.ok || !json.ok) {
+      setErrorMsg(json.error || 'Không thể chạy Farm Badge / Giờ chơi.');
+      return;
+    }
+    setState(json.state);
+    notify('Đã khởi chạy Farm Science Badge / Giờ chơi.');
+  };
+
+  const handleStopBadgeSpoof = async () => {
+    const res = await fetch('/api/badge/stop', { method: 'POST' });
+    const json = await res.json();
+    if (json.ok) {
+      setState(json.state);
+      notify('Đã dừng Farm Science Badge / Giờ chơi.');
+    }
   };
 
   const handleConnectRoblox = async (params: { identifier?: string; cookie?: string }) => {
@@ -847,10 +926,26 @@ export default function App() {
               quests={state.quests}
               lastQuestSyncAt={state.lastQuestSyncAt}
               activeAppId={state.config.applicationId}
+              questRunner={state.questRunner}
+              questBoostRatio={state.config.questBoostRatio}
+              questAutoBackToVN={state.config.questAutoBackToVN}
               onSyncStreak={handleSyncStreak}
               onSyncQuests={handleSyncQuests}
               onEnrollQuest={handleEnrollQuest}
               onSendQuestHeartbeat={handleSendQuestHeartbeat}
+              onRunAutoQuests={handleRunAutoQuests}
+              onStopAutoQuests={handleStopAutoQuests}
+              onSweepQuestRegions={handleSweepQuestRegions}
+              onUpdateQuestConfig={handleUpdateConfig}
+            />
+          )}
+
+          {activeTab === 'badge' && state && (
+            <BadgeSpoofTab
+              hasToken={state.hasToken}
+              badgeSpoof={state.badgeSpoof}
+              onStartSpoof={handleStartBadgeSpoof}
+              onStopSpoof={handleStopBadgeSpoof}
             />
           )}
 

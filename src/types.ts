@@ -33,6 +33,8 @@ export interface ActivityConfig {
   streamImageDataUrl: string;
   enableChatCommands: boolean;
   commandPrefix: string;
+  questBoostRatio: number;
+  questAutoBackToVN: boolean;
 }
 
 export interface RobloxLivePresence {
@@ -125,6 +127,27 @@ export interface VoiceStatePublic {
   streamImageUrl: string;
 }
 
+export interface QuestRunnerPublicState {
+  running: boolean;
+  sweeping: boolean;
+  currentRegion: string;
+  activeCount: number;
+  completedCount: number;
+  statusMessage: string;
+}
+
+export interface BadgeSpoofPublicState {
+  running: boolean;
+  mode: 'played_count' | 'playtime_hours';
+  processedGames: number;
+  totalGames: number;
+  hoursPerGame: number;
+  totalHoursAdded: number;
+  hasCookie: boolean;
+  maskedCookie: string;
+  statusMessage: string;
+}
+
 export interface BotPublicState {
   connectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
   hasToken: boolean;
@@ -145,5 +168,7 @@ export interface BotPublicState {
   lastQuestSyncAt: string | null;
   robloxAccount: RobloxAccountPublic | null;
   voice: VoiceStatePublic;
+  questRunner: QuestRunnerPublicState;
+  badgeSpoof: BadgeSpoofPublicState;
   logs: LogEntry[];
 }

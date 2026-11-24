@@ -185,6 +185,67 @@ app.post('/api/quests/:id/heartbeat', async (req, res) => {
   }
 });
 
+app.post('/api/quests/auto-run', (req, res) => {
+  try {
+    const boostRatio = typeof req.body?.boostRatio === 'number' ? req.body.boostRatio : undefined;
+    const sweepRegions = typeof req.body?.sweepRegions === 'boolean' ? req.body.sweepRegions : undefined;
+    const autoBackToVN = typeof req.body?.autoBackToVN === 'boolean' ? req.body.autoBackToVN : undefined;
+    const questRunner = selfBotManager.runAutoQuests({ boostRatio, sweepRegions, autoBackToVN });
+    res.json({ ok: true, questRunner, state: selfBotManager.getPublicState() });
+  } catch (err) {
+    res.status(400).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Không thể khởi chạy Auto Quest.',
+    });
+  }
+});
+
+app.post('/api/quests/auto-stop', (_req, res) => {
+  const questRunner = selfBotManager.stopAutoQuests();
+  res.json({ ok: true, questRunner, state: selfBotManager.getPublicState() });
+});
+
+app.post('/api/quests/sweep', (req, res) => {
+  try {
+    const autoBackToVN = typeof req.body?.autoBackToVN === 'boolean' ? req.body.autoBackToVN : undefined;
+    const questRunner = selfBotManager.sweepQuestRegions(autoBackToVN);
+    res.json({ ok: true, questRunner, state: selfBotManager.getPublicState() });
+  } catch (err) {
+    res.status(400).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Không thể quét Quest toàn cầu.',
+    });
+  }
+});
+
+app.post('/api/badge/start', (req, res) => {
+  try {
+    const mode = req.body?.mode === 'playtime_hours' ? 'playtime_hours' : 'played_count';
+    const gameLimit = typeof req.body?.gameLimit === 'number' ? req.body.gameLimit : 100;
+    const hoursPerGame = typeof req.body?.hoursPerGame === 'number' ? req.body.hoursPerGame : undefined;
+    const cookie = typeof req.body?.cookie === 'string' ? req.body.cookie : undefined;
+    const fingerprint = typeof req.body?.fingerprint === 'string' ? req.body.fingerprint : undefined;
+    const badgeSpoof = selfBotManager.startBadgeSpoof({
+      mode,
+      gameLimit,
+      hoursPerGame,
+      cookie,
+      fingerprint,
+    });
+    res.json({ ok: true, badgeSpoof, state: selfBotManager.getPublicState() });
+  } catch (err) {
+    res.status(400).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Không thể bắt đầu Farm Badge / Giờ chơi.',
+    });
+  }
+});
+
+app.post('/api/badge/stop', (_req, res) => {
+  const badgeSpoof = selfBotManager.stopBadgeSpoof();
+  res.json({ ok: true, badgeSpoof, state: selfBotManager.getPublicState() });
+});
+
 app.get('/api/export-script', (_req, res) => {
   const script = selfBotManager.generateStandaloneScript();
   res.json({ ok: true, filename: 'roblox-activity-bot.mjs', content: script });

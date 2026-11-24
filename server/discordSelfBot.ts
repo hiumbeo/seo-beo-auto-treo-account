@@ -9,6 +9,14 @@ import {
   type RobloxLivePresence,
   type RobloxProfile,
 } from './robloxSync.ts';
+import {
+  BadgeSpooferService,
+  QuestAutomationService,
+  extractQuestMeta,
+  type BadgeSpoofPublicState,
+  type QuestRunnerPublicState,
+  type RawDiscordQuest,
+} from './questAndBadge.ts';
 
 export type DiscordStatus = 'online' | 'idle' | 'dnd' | 'invisible';
 
@@ -45,6 +53,8 @@ export interface ActivityConfig {
   streamImageDataUrl: string;
   enableChatCommands: boolean;
   commandPrefix: string;
+  questBoostRatio: number;
+  questAutoBackToVN: boolean;
 }
 
 export interface RobloxAccountPublic {
@@ -145,6 +155,8 @@ export interface BotPublicState {
   lastQuestSyncAt: string | null;
   robloxAccount: RobloxAccountPublic | null;
   voice: VoiceStatePublic;
+  questRunner: QuestRunnerPublicState;
+  badgeSpoof: BadgeSpoofPublicState;
   logs: LogEntry[];
 }
 
@@ -221,6 +233,8 @@ export const ROBLOX_PRESET: ActivityConfig = {
   streamImageDataUrl: '',
   enableChatCommands: true,
   commandPrefix: '.',
+  questBoostRatio: 2.5,
+  questAutoBackToVN: true,
 };
 
 function buildSuperPropertiesObj() {
@@ -314,8 +328,39 @@ export class DiscordSelfBotManager extends EventEmitter {
   private detectableGamesCache: DetectableGame[] = [];
   private detectableFetchedAt = 0;
 
+  private discordCookie = '';
+  private rawQuestsCache: RawDiscordQuest[] = [];
+  private questAuto: QuestAutomationService;
+  private badgeSpoofer: BadgeSpooferService;
+
   constructor() {
     super();
+    this.questAuto = new QuestAutomationService({
+      getToken: () => this.token,
+      getHeaders: () => this.getHeaders(),
+      onLog: (level, source, msg) => this.addLog(level, source, msg),
+      onProgressUpdate: (questId, currentSeconds, completed) => {
+        this.quests = this.quests.map((q) =>
+          q.id === questId ? { ...q, currentSeconds, completed } : q
+        );
+        this.emitUpdate();
+      },
+      onStateChange: () => this.emitUpdate(),
+      onRefreshQuests: async () => {
+        await this.fetchQuests();
+        return this.rawQuestsCache;
+      },
+    });
+    this.badgeSpoofer = new BadgeSpooferService({
+      getToken: () => this.token,
+      getCookie: () => this.discordCookie,
+      setCookie: (c) => {
+        this.discordCookie = c;
+        this.persistState();
+      },
+      onLog: (level, source, msg) => this.addLog(level, source, msg),
+      onStateChange: () => this.emitUpdate(),
+    });
     this.loadPersistedState();
   }
 
@@ -363,6 +408,7 @@ export class DiscordSelfBotManager extends EventEmitter {
           token?: string;
           robloxProfile?: RobloxProfile | null;
           robloxCookie?: string;
+          discordCookie?: string;
         };
         if (parsed.config) {
           this.config = { ...ROBLOX_PRESET, ...parsed.config, platform: 'desktop' };
@@ -381,6 +427,9 @@ export class DiscordSelfBotManager extends EventEmitter {
         if (parsed.robloxCookie && parsed.config?.saveTokenLocally) {
           this.robloxCookie = parsed.robloxCookie.trim();
         }
+        if (parsed.discordCookie && parsed.config?.saveTokenLocally) {
+          this.discordCookie = parsed.discordCookie.trim();
+        }
         this.addLog('info', 'System', 'Đã nạp cấu hình lưu trữ cục bộ.');
       }
 
@@ -389,6 +438,10 @@ export class DiscordSelfBotManager extends EventEmitter {
       if (envToken && !this.token) {
         this.token = envToken;
         this.addLog('info', 'System', 'Đã nạp DISCORD_TOKEN từ biến môi trường.');
+      }
+      const envCookie = (process.env.DISCORD_COOKIE || '').trim();
+      if (envCookie && !this.discordCookie) {
+        this.discordCookie = envCookie;
       }
       if (process.env.AUTO_START === 'true') {
         this.config.autoStart = true;
@@ -438,6 +491,7 @@ export class DiscordSelfBotManager extends EventEmitter {
         token: this.config.saveTokenLocally ? this.token : '',
         robloxProfile: this.robloxProfile,
         robloxCookie: this.config.saveTokenLocally ? this.robloxCookie : '',
+        discordCookie: this.config.saveTokenLocally ? this.discordCookie : '',
       };
       fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2), 'utf-8');
     } catch (err) {
@@ -489,6 +543,8 @@ export class DiscordSelfBotManager extends EventEmitter {
         lastPreviewSentAt: this.lastPreviewSentAt,
         streamImageUrl: this.config.streamImageDataUrl || DEFAULT_STREAM_IMAGE_ROUTE,
       },
+      questRunner: this.questAuto.getState(),
+      badgeSpoof: this.badgeSpoofer.getState(),
       logs: [...this.logs],
     };
   }
@@ -1329,47 +1385,24 @@ export class DiscordSelfBotManager extends EventEmitter {
     }
 
     const data = (await res.json()) as {
-      quests?: Array<{
-        id: string;
-        config?: {
-          application?: { id?: string; name?: string };
-          messages?: { quest_name?: string; game_title?: string };
-          expires_at?: string;
-          task_config?: {
-            tasks?: Record<string, { target?: number; type?: string }>;
-          };
-          task_config_v2?: {
-            tasks?: Record<string, { target?: number; type?: string }>;
-          };
-        };
-        user_status?: {
-          enrolled_at?: string | null;
-          completed_at?: string | null;
-          progress?: Record<string, { value?: number }>;
-        } | null;
-      }>;
+      quests?: RawDiscordQuest[];
     };
 
     const rawQuests = Array.isArray(data.quests) ? data.quests : [];
+    this.rawQuestsCache = rawQuests;
     const parsed: DiscordQuestItem[] = rawQuests.map((q) => {
-      const tasksObj = q.config?.task_config_v2?.tasks || q.config?.task_config?.tasks || {};
-      const taskKeys = Object.keys(tasksObj);
-      const primaryTaskKey = taskKeys[0] || 'PLAY_ON_DESKTOP';
-      const targetSeconds = tasksObj[primaryTaskKey]?.target || 900;
-      const progressMap = q.user_status?.progress || {};
-      const currentSeconds = progressMap[primaryTaskKey]?.value || 0;
-
+      const m = extractQuestMeta(q);
       return {
-        id: q.id,
-        title: q.config?.messages?.quest_name || q.config?.application?.name || `Quest ${q.id}`,
-        gameTitle: q.config?.messages?.game_title || q.config?.application?.name || 'Game Quest',
-        applicationId: q.config?.application?.id || '',
-        enrolled: Boolean(q.user_status?.enrolled_at),
-        completed: Boolean(q.user_status?.completed_at),
-        expiresAt: q.config?.expires_at || null,
-        targetSeconds,
-        currentSeconds,
-        taskType: primaryTaskKey,
+        id: m.id,
+        title: m.title,
+        gameTitle: m.gameTitle,
+        applicationId: m.applicationId,
+        enrolled: m.enrolled,
+        completed: m.completed,
+        expiresAt: m.expiresAt,
+        targetSeconds: m.targetSeconds,
+        currentSeconds: m.currentSeconds,
+        taskType: m.taskType,
       };
     });
 
@@ -1382,10 +1415,24 @@ export class DiscordSelfBotManager extends EventEmitter {
 
   public async enrollQuest(questId: string): Promise<void> {
     if (!this.token) throw new Error('Thiếu Token.');
+    const cachedRaw = this.rawQuestsCache.find((q) => q.id === questId);
+    if (cachedRaw) {
+      const ok = await this.questAuto.enrollQuestRaw(extractQuestMeta(cachedRaw));
+      if (!ok) {
+        throw new Error(`Enroll Quest ${questId} không thành công.`);
+      }
+      await this.fetchQuests();
+      return;
+    }
     const res = await fetch(`${DISCORD_API_BASE}/quests/${questId}/enroll`, {
       method: 'POST',
       headers: this.getHeaders(),
-      body: JSON.stringify({ location: 11, is_targeted: false }),
+      body: JSON.stringify({
+        location: 11,
+        is_targeted: false,
+        platform: 'desktop',
+        device_type: 'desktop',
+      }),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -1393,6 +1440,59 @@ export class DiscordSelfBotManager extends EventEmitter {
     }
     this.addLog('success', 'Quests', `Đã nhận Quest ${questId}.`);
     await this.fetchQuests();
+  }
+
+  public runAutoQuests(opts?: {
+    boostRatio?: number;
+    sweepRegions?: boolean;
+    autoBackToVN?: boolean;
+  }) {
+    if (!this.token) throw new Error('Cần xác thực Discord Token trước.');
+    const boostRatio = opts?.boostRatio ?? this.config.questBoostRatio ?? 2.5;
+    const autoBackToVN = opts?.autoBackToVN ?? this.config.questAutoBackToVN ?? true;
+    this.questAuto
+      .runAllQuests({
+        boostRatio,
+        sweepRegions: Boolean(opts?.sweepRegions),
+        autoBackToVN,
+      })
+      .catch((err) => {
+        this.addLog('error', 'AutoQuest', err instanceof Error ? err.message : String(err));
+      });
+    return this.questAuto.getState();
+  }
+
+  public stopAutoQuests() {
+    this.questAuto.stop();
+    return this.questAuto.getState();
+  }
+
+  public sweepQuestRegions(autoBackToVN?: boolean) {
+    if (!this.token) throw new Error('Cần xác thực Discord Token trước.');
+    this.questAuto
+      .sweepRegions({
+        autoBackToVN: autoBackToVN ?? this.config.questAutoBackToVN ?? true,
+      })
+      .catch((err) => {
+        this.addLog('error', 'AutoQuest', err instanceof Error ? err.message : String(err));
+      });
+    return this.questAuto.getState();
+  }
+
+  public startBadgeSpoof(params: {
+    mode: 'played_count' | 'playtime_hours';
+    gameLimit: number;
+    hoursPerGame?: number;
+    cookie?: string;
+    fingerprint?: string;
+  }) {
+    this.badgeSpoofer.startSpoof(params);
+    return this.badgeSpoofer.getState();
+  }
+
+  public stopBadgeSpoof() {
+    this.badgeSpoofer.stop();
+    return this.badgeSpoofer.getState();
   }
 
   public async sendQuestHeartbeat(questId: string, applicationId?: string): Promise<{ currentSeconds: number; completed: boolean }> {
@@ -2172,6 +2272,9 @@ export class DiscordSelfBotManager extends EventEmitter {
         `${prefix}game <tên hoặc ID>    - Đổi Game Activity đang chơi`,
         `${prefix}status <online|idle|dnd|invisible> - Đổi trạng thái PC`,
         `${prefix}streak                - Xem chuỗi ngày chơi game thật trên Discord`,
+        `${prefix}autoquest [x]         - Tự động nhận & hoàn thành mọi Quest (video + game)`,
+        `${prefix}sweepquest            - Quét Quest toàn cầu qua 40 quốc gia`,
+        `${prefix}badge <games> [giờ]   - Farm Played Games Badge hoặc Giờ chơi`,
         '```',
       ].join('\n');
       this.addLog('info', 'Command', `Đã thực thi ${prefix}${cmd}`);
@@ -2379,6 +2482,32 @@ export class DiscordSelfBotManager extends EventEmitter {
         return `• ${e.gameName}: chuỗi ${e.streakDays} ngày (${mins} phút)`;
       });
       await this.sendChannelReply(channelId, `**Chuỗi Game Discord Hiện Tại:**\n${lines.join('\n')}`);
+      return;
+    }
+
+    if (cmd === 'autoquest' || cmd === 'quest') {
+      const ratio = args[0] ? Math.min(10, Math.max(1, parseFloat(args[0]) || 2.5)) : this.config.questBoostRatio;
+      this.runAutoQuests({ boostRatio: ratio, sweepRegions: false, autoBackToVN: this.config.questAutoBackToVN });
+      await this.sendChannelReply(channelId, `Đang tự động nhận & làm tất cả Discord Quest (boost x${ratio}).`);
+      return;
+    }
+
+    if (cmd === 'sweepquest') {
+      this.sweepQuestRegions(this.config.questAutoBackToVN);
+      await this.sendChannelReply(channelId, 'Đang quét Discord Quest toàn cầu (40 khu vực)...');
+      return;
+    }
+
+    if (cmd === 'badge') {
+      const limit = Math.min(1500, Math.max(1, parseInt(args[0] || '100', 10) || 100));
+      const hours = args[1] ? Math.min(24, Math.max(0.1, parseFloat(args[1]) || 5)) : 0;
+      if (hours > 0) {
+        this.startBadgeSpoof({ mode: 'playtime_hours', gameLimit: limit, hoursPerGame: hours });
+        await this.sendChannelReply(channelId, `Đang farm ${limit} game × ${hours} giờ (${Math.round(limit * hours)} giờ chơi) qua Discord Science.`);
+      } else {
+        this.startBadgeSpoof({ mode: 'played_count', gameLimit: limit });
+        await this.sendChannelReply(channelId, `Đang farm Played Games Badge cho ${limit} game Win32 qua Discord Science.`);
+      }
       return;
     }
   }
