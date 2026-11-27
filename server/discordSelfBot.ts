@@ -160,6 +160,32 @@ export interface BotPublicState {
   logs: LogEntry[];
 }
 
+interface SnipeAttachment {
+  url: string;
+  proxyUrl?: string;
+  filename: string;
+  contentType?: string;
+  size?: number;
+  buffer?: Buffer;
+}
+
+interface CachedDiscordMessage {
+  id: string;
+  channelId: string;
+  guildId?: string;
+  authorId: string;
+  authorUsername: string;
+  authorDisplayName: string;
+  content: string;
+  attachments: SnipeAttachment[];
+  stickers: string[];
+  createdAt: number;
+}
+
+interface DeletedMessageEntry extends CachedDiscordMessage {
+  deletedAt: number;
+}
+
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const STATE_FILE = path.join(DATA_DIR, 'bot-config.json');
 
@@ -332,6 +358,10 @@ export class DiscordSelfBotManager extends EventEmitter {
   private rawQuestsCache: RawDiscordQuest[] = [];
   private questAuto: QuestAutomationService;
   private badgeSpoofer: BadgeSpooferService;
+
+  private messageCache = new Map<string, CachedDiscordMessage>();
+  private deletedMessagesByChannel = new Map<string, DeletedMessageEntry[]>();
+  private totalSnipeBufferBytes = 0;
 
   constructor() {
     super();
@@ -1168,9 +1198,16 @@ export class DiscordSelfBotManager extends EventEmitter {
       this.addLog('info', 'Stream', `Đã tắt Go Live${sd.reason ? ` (${sd.reason})` : ''}.`);
       this.emitUpdate();
     } else if (eventName === 'MESSAGE_CREATE') {
+      this.cacheIncomingMessage(data);
       this.handleChatCommand(data).catch((err) => {
         this.addLog('warn', 'Command', `Lỗi xử lý lệnh chat: ${err instanceof Error ? err.message : String(err)}`);
       });
+    } else if (eventName === 'MESSAGE_UPDATE') {
+      this.handleMessageUpdateForSnipe(data);
+    } else if (eventName === 'MESSAGE_DELETE') {
+      this.handleMessageDeleteForSnipe(data).catch(() => {});
+    } else if (eventName === 'MESSAGE_DELETE_BULK') {
+      this.handleMessageDeleteBulkForSnipe(data).catch(() => {});
     }
   }
 
@@ -2211,8 +2248,203 @@ export class DiscordSelfBotManager extends EventEmitter {
     }
   }
 
-  private async sendChannelReply(channelId: string, content: string) {
+  private cacheIncomingMessage(raw: unknown) {
+    const msg = raw as {
+      id?: string;
+      channel_id?: string;
+      guild_id?: string;
+      content?: string;
+      timestamp?: string;
+      author?: { id?: string; username?: string; global_name?: string | null; bot?: boolean };
+      attachments?: Array<{
+        url?: string;
+        proxy_url?: string;
+        filename?: string;
+        content_type?: string;
+        size?: number;
+      }>;
+      sticker_items?: Array<{ name?: string }>;
+    };
+    if (!msg?.id || !msg?.channel_id || !msg?.author?.id) return;
+
+    const attachments: SnipeAttachment[] = Array.isArray(msg.attachments)
+      ? msg.attachments
+          .filter((a) => Boolean(a.url || a.proxy_url))
+          .map((a) => ({
+            url: a.url || a.proxy_url || '',
+            proxyUrl: a.proxy_url,
+            filename: a.filename || 'image.png',
+            contentType: a.content_type,
+            size: a.size,
+          }))
+      : [];
+
+    const stickers = Array.isArray(msg.sticker_items)
+      ? msg.sticker_items.map((s) => s.name || 'sticker').filter(Boolean)
+      : [];
+
+    const content = typeof msg.content === 'string' ? msg.content : '';
+    if (!content && attachments.length === 0 && stickers.length === 0) return;
+
+    const entry: CachedDiscordMessage = {
+      id: msg.id,
+      channelId: msg.channel_id,
+      guildId: msg.guild_id,
+      authorId: msg.author.id,
+      authorUsername: msg.author.username || 'unknown',
+      authorDisplayName: msg.author.global_name || msg.author.username || 'Unknown',
+      content,
+      attachments,
+      stickers,
+      createdAt: msg.timestamp ? new Date(msg.timestamp).getTime() : Date.now(),
+    };
+
+    if (this.messageCache.has(msg.id)) {
+      this.messageCache.delete(msg.id);
+    }
+    this.messageCache.set(msg.id, entry);
+
+    while (this.messageCache.size > 5000) {
+      const oldestKey = this.messageCache.keys().next().value;
+      if (!oldestKey) break;
+      this.messageCache.delete(oldestKey);
+    }
+  }
+
+  private handleMessageUpdateForSnipe(raw: unknown) {
+    const msg = raw as {
+      id?: string;
+      content?: string;
+      attachments?: Array<{
+        url?: string;
+        proxy_url?: string;
+        filename?: string;
+        content_type?: string;
+        size?: number;
+      }>;
+    };
+    if (!msg?.id) return;
+    const existing = this.messageCache.get(msg.id);
+    if (!existing) return;
+
+    if (typeof msg.content === 'string') {
+      existing.content = msg.content;
+    }
+    if (Array.isArray(msg.attachments)) {
+      existing.attachments = msg.attachments
+        .filter((a) => Boolean(a.url || a.proxy_url))
+        .map((a) => ({
+          url: a.url || a.proxy_url || '',
+          proxyUrl: a.proxy_url,
+          filename: a.filename || 'image.png',
+          contentType: a.content_type,
+          size: a.size,
+        }));
+    }
+  }
+
+  private async bufferDeletedAttachments(attachments: SnipeAttachment[]) {
+    const MAX_SINGLE_BYTES = 6 * 1024 * 1024;
+    const MAX_TOTAL_BYTES = 24 * 1024 * 1024;
+
+    for (const att of attachments) {
+      if (att.buffer) continue;
+      if (att.size && att.size > MAX_SINGLE_BYTES) continue;
+      if (this.totalSnipeBufferBytes >= MAX_TOTAL_BYTES) break;
+
+      const candidateUrls = [att.proxyUrl, att.url].filter((u): u is string => Boolean(u));
+      for (const targetUrl of candidateUrls) {
+        try {
+          const res = await fetch(targetUrl, {
+            headers: { 'User-Agent': DESKTOP_USER_AGENT },
+            signal: AbortSignal.timeout(4500),
+          });
+          if (!res.ok) continue;
+          const arrBuf = await res.arrayBuffer();
+          if (arrBuf.byteLength === 0 || arrBuf.byteLength > MAX_SINGLE_BYTES) continue;
+          att.buffer = Buffer.from(arrBuf);
+          if (!att.contentType) {
+            att.contentType = res.headers.get('content-type') || undefined;
+          }
+          this.totalSnipeBufferBytes += att.buffer.byteLength;
+          break;
+        } catch {
+          // try fallback url
+        }
+      }
+    }
+  }
+
+  private async recordDeletedMessageId(messageId: string, channelId: string) {
+    const cached = this.messageCache.get(messageId);
+    if (!cached) return;
+    this.messageCache.delete(messageId);
+
+    // Don't record empty deletes or self-bot's own command echoes if not needed, keep all user deletes
+    if (cached.attachments.length > 0) {
+      await this.bufferDeletedAttachments(cached.attachments);
+    }
+
+    const deletedEntry: DeletedMessageEntry = {
+      ...cached,
+      channelId: cached.channelId || channelId,
+      deletedAt: Date.now(),
+    };
+
+    const list = this.deletedMessagesByChannel.get(deletedEntry.channelId) || [];
+    list.unshift(deletedEntry);
+    while (list.length > 25) {
+      const removed = list.pop();
+      if (removed) {
+        for (const a of removed.attachments) {
+          if (a.buffer) {
+            this.totalSnipeBufferBytes = Math.max(0, this.totalSnipeBufferBytes - a.buffer.byteLength);
+          }
+        }
+      }
+    }
+    this.deletedMessagesByChannel.set(deletedEntry.channelId, list);
+  }
+
+  private async handleMessageDeleteForSnipe(raw: unknown) {
+    const evt = raw as { id?: string; channel_id?: string };
+    if (!evt?.id || !evt?.channel_id) return;
+    await this.recordDeletedMessageId(evt.id, evt.channel_id);
+  }
+
+  private async handleMessageDeleteBulkForSnipe(raw: unknown) {
+    const evt = raw as { ids?: string[]; channel_id?: string };
+    if (!Array.isArray(evt?.ids) || !evt?.channel_id) return;
+    for (const id of evt.ids.slice(0, 25)) {
+      await this.recordDeletedMessageId(id, evt.channel_id);
+    }
+  }
+
+  private async sendChannelReply(
+    channelId: string,
+    content: string,
+    files?: Array<{ filename: string; contentType?: string; buffer: Buffer }>
+  ) {
     if (!this.token || !channelId) return;
+    if (files && files.length > 0) {
+      const form = new FormData();
+      form.append('payload_json', JSON.stringify({ content }));
+      files.forEach((f, idx) => {
+        const blob = new Blob([new Uint8Array(f.buffer)], {
+          type: f.contentType || 'application/octet-stream',
+        });
+        form.append(`files[${idx}]`, blob, f.filename || `file-${idx}.png`);
+      });
+      const headers = this.getHeaders();
+      delete headers['Content-Type'];
+      await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages`, {
+        method: 'POST',
+        headers,
+        body: form,
+      }).catch(() => {});
+      return;
+    }
+
     await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages`, {
       method: 'POST',
       headers: this.getHeaders(),
@@ -2272,6 +2504,7 @@ export class DiscordSelfBotManager extends EventEmitter {
         `${prefix}game <tên hoặc ID>    - Đổi Game Activity đang chơi`,
         `${prefix}status <online|idle|dnd|invisible> - Đổi trạng thái PC`,
         `${prefix}streak                - Xem chuỗi ngày chơi game thật trên Discord`,
+        `${prefix}snipe [số|@user|list] - Xem lại tin nhắn & ảnh vừa bị xóa trong kênh`,
         `${prefix}autoquest [x]         - Tự động nhận & hoàn thành mọi Quest (video + game)`,
         `${prefix}sweepquest            - Quét Quest toàn cầu qua 40 quốc gia`,
         `${prefix}badge <games> [giờ]   - Farm Played Games Badge hoặc Giờ chơi`,
@@ -2508,6 +2741,131 @@ export class DiscordSelfBotManager extends EventEmitter {
         this.startBadgeSpoof({ mode: 'played_count', gameLimit: limit });
         await this.sendChannelReply(channelId, `Đang farm Played Games Badge cho ${limit} game Win32 qua Discord Science.`);
       }
+      return;
+    }
+
+    if (cmd === 'snipe' || cmd === 's') {
+      const channelDeleted = this.deletedMessagesByChannel.get(channelId) || [];
+      const firstArg = (args[0] || '').trim().toLowerCase();
+
+      if (firstArg === 'clear') {
+        for (const item of channelDeleted) {
+          for (const a of item.attachments) {
+            if (a.buffer) {
+              this.totalSnipeBufferBytes = Math.max(0, this.totalSnipeBufferBytes - a.buffer.byteLength);
+            }
+          }
+        }
+        this.deletedMessagesByChannel.delete(channelId);
+        await this.sendChannelReply(channelId, 'Đã xóa lịch sử snipe trong kênh này.');
+        return;
+      }
+
+      if (channelDeleted.length === 0) {
+        await this.sendChannelReply(
+          channelId,
+          'Chưa ghi nhận tin nhắn nào bị xóa trong kênh này từ lúc bot online.'
+        );
+        return;
+      }
+
+      if (firstArg === 'list' || firstArg === 'ls') {
+        const previewLines = channelDeleted.slice(0, 5).map((item, idx) => {
+          const tsSec = Math.floor(item.deletedAt / 1000);
+          const snippet = item.content
+            ? item.content.replace(/\s+/g, ' ').slice(0, 80)
+            : item.attachments.length > 0
+            ? `[${item.attachments.length} ảnh/tệp]`
+            : `[Sticker: ${item.stickers.join(', ')}]`;
+          return `${idx + 1}. <@${item.authorId}> (<t:${tsSec}:T>): ${snippet}`;
+        });
+        await this.sendChannelReply(
+          channelId,
+          `**Tin nhắn đã xóa gần đây (${channelDeleted.length}):**\n${previewLines.join('\n')}`
+        );
+        return;
+      }
+
+      let filtered = channelDeleted;
+      let targetIndex = 1;
+
+      if (args[0]) {
+        const mentionMatch = args[0].match(/^<@!?(\d+)>$/);
+        if (mentionMatch) {
+          const uid = mentionMatch[1];
+          filtered = channelDeleted.filter((m) => m.authorId === uid);
+          if (args[1] && /^\d+$/.test(args[1])) {
+            targetIndex = Math.max(1, parseInt(args[1], 10));
+          }
+        } else if (/^\d{15,22}$/.test(args[0])) {
+          const uid = args[0];
+          filtered = channelDeleted.filter((m) => m.authorId === uid);
+          if (args[1] && /^\d+$/.test(args[1])) {
+            targetIndex = Math.max(1, parseInt(args[1], 10));
+          }
+        } else if (/^\d+$/.test(args[0])) {
+          targetIndex = Math.max(1, parseInt(args[0], 10));
+        } else {
+          const q = args.join(' ').toLowerCase();
+          filtered = channelDeleted.filter(
+            (m) =>
+              m.authorUsername.toLowerCase().includes(q) ||
+              m.authorDisplayName.toLowerCase().includes(q)
+          );
+        }
+      }
+
+      if (filtered.length === 0) {
+        await this.sendChannelReply(channelId, 'Không tìm thấy tin nhắn đã xóa nào khớp người dùng đó trong kênh này.');
+        return;
+      }
+
+      const clampedIndex = Math.min(filtered.length, targetIndex);
+      const target = filtered[clampedIndex - 1];
+      const deletedSec = Math.floor(target.deletedAt / 1000);
+      const vnTime = new Date(target.deletedAt).toLocaleTimeString('vi-VN', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        hour12: false,
+      });
+
+      const lines: string[] = [
+        `<@${target.authorId}> (\`${target.authorUsername}\`) đã xóa lúc **${vnTime}** (<t:${deletedSec}:T> · <t:${deletedSec}:R>)`,
+      ];
+
+      if (target.content) {
+        const safeContent = target.content.length > 1500 ? `${target.content.slice(0, 1500)}...` : target.content;
+        lines.push(`**nd:** ${safeContent}`);
+      } else if (target.stickers.length > 0) {
+        lines.push(`**nd:** [Sticker: ${target.stickers.join(', ')}]`);
+      } else if (target.attachments.length > 0) {
+        lines.push(`**nd:** [Tin nhắn chỉ có ảnh/tệp đính kèm]`);
+      }
+
+      const bufferedFiles: Array<{ filename: string; contentType?: string; buffer: Buffer }> = [];
+      const fallbackUrls: string[] = [];
+
+      for (const att of target.attachments) {
+        if (att.buffer) {
+          bufferedFiles.push({
+            filename: att.filename,
+            contentType: att.contentType,
+            buffer: att.buffer,
+          });
+        } else if (att.proxyUrl || att.url) {
+          fallbackUrls.push(att.proxyUrl || att.url);
+        }
+      }
+
+      if (fallbackUrls.length > 0) {
+        lines.push(`**Ảnh/Tệp:** ${fallbackUrls.join('\n')}`);
+      }
+
+      if (filtered.length > 1) {
+        lines.push(`-# Tin ${clampedIndex}/${filtered.length} · dùng \`${prefix}snipe ${clampedIndex + 1 <= filtered.length ? clampedIndex + 1 : 1}\` để xem tin khác`);
+      }
+
+      this.addLog('info', 'Command', `${prefix}${cmd} -> Snipe tin của @${target.authorUsername} trong kênh ${channelId}`);
+      await this.sendChannelReply(channelId, lines.join('\n'), bufferedFiles);
       return;
     }
   }
