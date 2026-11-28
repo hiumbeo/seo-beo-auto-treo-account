@@ -148,6 +148,33 @@ export interface BadgeSpoofPublicState {
   statusMessage: string;
 }
 
+export interface SnipeAttachmentPublic {
+  filename: string;
+  contentType?: string;
+  url: string;
+  proxyUrl?: string;
+  isImage: boolean;
+  hasBufferedImage: boolean;
+  imageRoute?: string;
+}
+
+export interface SnipedMessagePublic {
+  id: string;
+  channelId: string;
+  channelName?: string;
+  guildId?: string;
+  guildName?: string;
+  authorId: string;
+  authorUsername: string;
+  authorDisplayName: string;
+  authorAvatarUrl: string | null;
+  content: string;
+  stickers: string[];
+  attachments: SnipeAttachmentPublic[];
+  createdAt: number;
+  deletedAt: number;
+}
+
 export interface BotPublicState {
   connectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
   hasToken: boolean;
@@ -171,4 +198,5 @@ export interface BotPublicState {
   questRunner: QuestRunnerPublicState;
   badgeSpoof: BadgeSpoofPublicState;
   logs: LogEntry[];
+  snipedMessages: SnipedMessagePublic[];
 }

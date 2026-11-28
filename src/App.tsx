@@ -8,6 +8,7 @@ import {
   EyeOff,
   Flame,
   Gamepad2,
+  History,
   KeyRound,
   LayoutDashboard,
   Menu,
@@ -27,9 +28,10 @@ import { StreakAndQuestsTab } from './components/StreakAndQuestsTab';
 import { VoiceStreamTab } from './components/VoiceStreamTab';
 import { BadgeSpoofTab } from './components/BadgeSpoofTab';
 import { LogsTab } from './components/LogsTab';
+import { SnipeTab } from './components/SnipeTab';
 import { ExportBotTab } from './components/ExportBotTab';
 
-type NavTab = 'overview' | 'roblox' | 'games' | 'voice' | 'streak' | 'badge' | 'logs' | 'export';
+type NavTab = 'overview' | 'roblox' | 'games' | 'voice' | 'streak' | 'badge' | 'logs' | 'snipe' | 'export';
 
 const NAV_ITEMS: Array<{ id: NavTab; label: string; icon: typeof LayoutDashboard }> = [
   { id: 'overview', label: 'Bảng điều khiển', icon: LayoutDashboard },
@@ -38,6 +40,7 @@ const NAV_ITEMS: Array<{ id: NavTab; label: string; icon: typeof LayoutDashboard
   { id: 'voice', label: 'Voice & Stream Ảnh', icon: Volume2 },
   { id: 'streak', label: 'Chuỗi & Auto Quest', icon: Flame },
   { id: 'badge', label: 'Farm Badge & Giờ Chơi', icon: Award },
+  { id: 'snipe', label: 'Snipe Tin Xóa', icon: History },
   { id: 'logs', label: 'Nhật ký Gateway', icon: Terminal },
   { id: 'export', label: 'Host Render & Export', icon: Code2 },
 ];
@@ -378,6 +381,20 @@ export default function App() {
     notify('Đã làm mới trạng thái tài khoản Roblox.');
   };
 
+  const handleClearSnipe = async (channelId?: string) => {
+    setErrorMsg(null);
+    const res = await fetch('/api/snipe/clear', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channelId }),
+    });
+    const json = await res.json();
+    if (json.ok) {
+      setState(json.state);
+      notify(channelId ? 'Đã xóa lịch sử snipe của kênh đã chọn.' : 'Đã xóa toàn bộ lịch sử snipe.');
+    }
+  };
+
   const connMeta = state
     ? CONNECTION_LABELS[state.connectionState]
     : CONNECTION_LABELS.disconnected;
@@ -432,7 +449,12 @@ export default function App() {
                 }`}
               >
                 <Icon className={`w-4 h-4 shrink-0 ${active ? 'text-[#5865F2]' : 'text-slate-500'}`} />
-                <span>{item.label}</span>
+                <span className="flex-1 text-left">{item.label}</span>
+                {item.id === 'snipe' && (state?.snipedMessages?.length || 0) > 0 && (
+                  <span className="px-1.5 py-0.5 text-[10px] font-mono bg-[#5865F2]/25 text-[#A5B4FC] rounded">
+                    {state?.snipedMessages.length}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -949,7 +971,21 @@ export default function App() {
             />
           )}
 
-          {activeTab === 'logs' && state && <LogsTab logs={state.logs} />}
+          {activeTab === 'snipe' && state && (
+            <SnipeTab
+              snipedMessages={state.snipedMessages || []}
+              gatewayConnected={state.connectionState === 'connected'}
+              onClearSnipe={handleClearSnipe}
+            />
+          )}
+
+          {activeTab === 'logs' && state && (
+            <LogsTab
+              logs={state.logs}
+              snipedCount={state.snipedMessages?.length || 0}
+              onOpenSnipe={() => setActiveTab('snipe')}
+            />
+          )}
 
           {activeTab === 'export' && <ExportBotTab />}
         </main>

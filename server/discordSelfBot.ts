@@ -135,6 +135,33 @@ export interface VoiceStatePublic {
   streamImageUrl: string;
 }
 
+export interface SnipeAttachmentPublic {
+  filename: string;
+  contentType?: string;
+  url: string;
+  proxyUrl?: string;
+  isImage: boolean;
+  hasBufferedImage: boolean;
+  imageRoute?: string;
+}
+
+export interface SnipedMessagePublic {
+  id: string;
+  channelId: string;
+  channelName?: string;
+  guildId?: string;
+  guildName?: string;
+  authorId: string;
+  authorUsername: string;
+  authorDisplayName: string;
+  authorAvatarUrl: string | null;
+  content: string;
+  stickers: string[];
+  attachments: SnipeAttachmentPublic[];
+  createdAt: number;
+  deletedAt: number;
+}
+
 export interface BotPublicState {
   connectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
   hasToken: boolean;
@@ -158,6 +185,7 @@ export interface BotPublicState {
   questRunner: QuestRunnerPublicState;
   badgeSpoof: BadgeSpoofPublicState;
   logs: LogEntry[];
+  snipedMessages: SnipedMessagePublic[];
 }
 
 interface SnipeAttachment {
@@ -176,6 +204,7 @@ interface CachedDiscordMessage {
   authorId: string;
   authorUsername: string;
   authorDisplayName: string;
+  authorAvatar?: string | null;
   content: string;
   attachments: SnipeAttachment[];
   stickers: string[];
@@ -183,6 +212,8 @@ interface CachedDiscordMessage {
 }
 
 interface DeletedMessageEntry extends CachedDiscordMessage {
+  channelName?: string;
+  guildName?: string;
   deletedAt: number;
 }
 
@@ -361,6 +392,8 @@ export class DiscordSelfBotManager extends EventEmitter {
 
   private messageCache = new Map<string, CachedDiscordMessage>();
   private deletedMessagesByChannel = new Map<string, DeletedMessageEntry[]>();
+  private guildNameCache = new Map<string, string>();
+  private channelNameCache = new Map<string, { name: string; guildId?: string }>();
   private totalSnipeBufferBytes = 0;
   private subscribedGuildIds = new Set<string>();
   private subscribedChannelKeys = new Set<string>();
@@ -580,6 +613,7 @@ export class DiscordSelfBotManager extends EventEmitter {
       questRunner: this.questAuto.getState(),
       badgeSpoof: this.badgeSpoofer.getState(),
       logs: [...this.logs],
+      snipedMessages: this.getSnipedMessages(),
     };
   }
 
@@ -1081,8 +1115,10 @@ export class DiscordSelfBotManager extends EventEmitter {
         analytics_token?: string;
         guilds?: Array<{
           id: string;
+          name?: string;
+          properties?: { name?: string };
           unavailable?: boolean;
-          channels?: Array<{ id: string; type?: number }>;
+          channels?: Array<{ id: string; name?: string; type?: number }>;
         }>;
       };
       this.reconnectAttempt = 0;
@@ -1102,6 +1138,7 @@ export class DiscordSelfBotManager extends EventEmitter {
       );
 
       if (Array.isArray(ready.guilds) && ready.guilds.length > 0) {
+        this.cacheGuildMetadata(ready.guilds);
         this.subscribeGuildsBulk(ready.guilds);
       }
 
@@ -1218,10 +1255,18 @@ export class DiscordSelfBotManager extends EventEmitter {
     } else if (eventName === 'GUILD_CREATE') {
       const g = data as {
         id?: string;
-        channels?: Array<{ id: string; type?: number }>;
+        name?: string;
+        properties?: { name?: string };
+        channels?: Array<{ id: string; name?: string; type?: number }>;
       };
       if (g?.id) {
+        this.cacheGuildMetadata([g as { id: string; name?: string; properties?: { name?: string }; channels?: Array<{ id: string; name?: string; type?: number }> }]);
         this.subscribeSingleGuild(g.id, g.channels);
+      }
+    } else if (eventName === 'CHANNEL_CREATE' || eventName === 'CHANNEL_UPDATE') {
+      const ch = data as { id?: string; name?: string; guild_id?: string };
+      if (ch?.id && ch?.name) {
+        this.channelNameCache.set(ch.id, { name: ch.name, guildId: ch.guild_id });
       }
     } else if (eventName === 'MESSAGE_CREATE') {
       this.ensureChannelSubscribed(data);
@@ -2400,7 +2445,7 @@ export class DiscordSelfBotManager extends EventEmitter {
       guild_id?: string;
       content?: string;
       timestamp?: string;
-      author?: { id?: string; username?: string; global_name?: string | null; bot?: boolean };
+      author?: { id?: string; username?: string; global_name?: string | null; avatar?: string | null; bot?: boolean };
       attachments?: Array<{
         url?: string;
         proxy_url?: string;
@@ -2489,6 +2534,7 @@ export class DiscordSelfBotManager extends EventEmitter {
       authorId: msg.author.id,
       authorUsername: msg.author.username || 'unknown',
       authorDisplayName: msg.author.global_name || msg.author.username || 'Unknown',
+      authorAvatar: msg.author.avatar || null,
       content,
       attachments,
       stickers,
@@ -2597,6 +2643,107 @@ export class DiscordSelfBotManager extends EventEmitter {
     }
   }
 
+  private cacheGuildMetadata(
+    guilds: Array<{
+      id: string;
+      name?: string;
+      properties?: { name?: string };
+      channels?: Array<{ id: string; name?: string; type?: number }>;
+    }>
+  ) {
+    for (const g of guilds) {
+      if (!g?.id) continue;
+      const gName = g.properties?.name || g.name;
+      if (gName) {
+        this.guildNameCache.set(g.id, gName);
+      }
+      if (Array.isArray(g.channels)) {
+        for (const ch of g.channels) {
+          if (ch?.id && ch?.name) {
+            this.channelNameCache.set(ch.id, { name: ch.name, guildId: g.id });
+          }
+        }
+      }
+    }
+  }
+
+  public getSnipedMessages(): SnipedMessagePublic[] {
+    const out: SnipedMessagePublic[] = [];
+    for (const list of this.deletedMessagesByChannel.values()) {
+      for (const item of list) {
+        const avatarUrl = item.authorAvatar
+          ? `https://cdn.discordapp.com/avatars/${item.authorId}/${item.authorAvatar}.${item.authorAvatar.startsWith('a_') ? 'gif' : 'png'}?size=64`
+          : null;
+        out.push({
+          id: item.id,
+          channelId: item.channelId,
+          channelName: item.channelName,
+          guildId: item.guildId,
+          guildName: item.guildName,
+          authorId: item.authorId,
+          authorUsername: item.authorUsername,
+          authorDisplayName: item.authorDisplayName,
+          authorAvatarUrl: avatarUrl,
+          content: item.content,
+          stickers: [...item.stickers],
+          attachments: item.attachments.map((att, idx) => {
+            const isImg = this.isImageAttachment(att);
+            return {
+              filename: att.filename,
+              contentType: att.contentType,
+              url: att.proxyUrl || att.url,
+              proxyUrl: att.proxyUrl,
+              isImage: isImg,
+              hasBufferedImage: Boolean(att.buffer),
+              imageRoute: isImg ? `/api/snipe/image/${encodeURIComponent(item.id)}/${idx}` : undefined,
+            };
+          }),
+          createdAt: item.createdAt,
+          deletedAt: item.deletedAt,
+        });
+      }
+    }
+    out.sort((a, b) => b.deletedAt - a.deletedAt);
+    return out;
+  }
+
+  public getSnipeAttachmentData(
+    messageId: string,
+    index: number
+  ): { buffer?: Buffer; contentType?: string; filename: string; url: string } | null {
+    for (const list of this.deletedMessagesByChannel.values()) {
+      const found = list.find((m) => m.id === messageId);
+      if (found && found.attachments[index]) {
+        const att = found.attachments[index];
+        return {
+          buffer: att.buffer,
+          contentType: att.contentType,
+          filename: att.filename,
+          url: att.proxyUrl || att.url,
+        };
+      }
+    }
+    return null;
+  }
+
+  public clearSnipedMessages(channelId?: string) {
+    if (channelId) {
+      const list = this.deletedMessagesByChannel.get(channelId) || [];
+      for (const item of list) {
+        for (const a of item.attachments) {
+          if (a.buffer) {
+            this.totalSnipeBufferBytes = Math.max(0, this.totalSnipeBufferBytes - a.buffer.byteLength);
+          }
+        }
+      }
+      this.deletedMessagesByChannel.delete(channelId);
+    } else {
+      this.deletedMessagesByChannel.clear();
+      this.totalSnipeBufferBytes = 0;
+    }
+    this.emitUpdate();
+  }
+
   private async recordDeletedMessageId(messageId: string, channelId: string) {
     if (this.ignoredDeleteIds.has(messageId)) {
       this.ignoredDeleteIds.delete(messageId);
@@ -2612,9 +2759,25 @@ export class DiscordSelfBotManager extends EventEmitter {
       await this.bufferDeletedAttachments(cached.attachments);
     }
 
+    const resolvedChannelId = cached.channelId || channelId;
+    let cachedCh = this.channelNameCache.get(resolvedChannelId);
+    if (!cachedCh && cached.guildId) {
+      const info = await this.resolveChannelInfo(resolvedChannelId).catch(() => null);
+      if (info?.name) {
+        cachedCh = { name: info.name, guildId: info.guild_id || cached.guildId };
+        this.channelNameCache.set(resolvedChannelId, cachedCh);
+      }
+    }
+
+    const resolvedGuildId = cached.guildId || cachedCh?.guildId;
+    const resolvedGuildName = resolvedGuildId ? this.guildNameCache.get(resolvedGuildId) : undefined;
+
     const deletedEntry: DeletedMessageEntry = {
       ...cached,
-      channelId: cached.channelId || channelId,
+      channelId: resolvedChannelId,
+      channelName: cachedCh?.name,
+      guildId: resolvedGuildId,
+      guildName: resolvedGuildName,
       deletedAt: Date.now(),
     };
 
@@ -2634,7 +2797,9 @@ export class DiscordSelfBotManager extends EventEmitter {
     this.addLog(
       'info',
       'Snipe',
-      `Đã bắt 1 tin xóa của @${deletedEntry.authorUsername} tại kênh ${deletedEntry.channelId}`
+      `Đã bắt 1 tin xóa của @${deletedEntry.authorUsername} tại ${
+        deletedEntry.channelName ? `#${deletedEntry.channelName}` : `kênh ${deletedEntry.channelId}`
+      }`
     );
   }
 

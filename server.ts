@@ -359,6 +359,57 @@ app.post('/api/voice/stream/image', (req, res) => {
   }
 });
 
+app.get('/api/snipe', (_req, res) => {
+  res.json({ ok: true, items: selfBotManager.getSnipedMessages() });
+});
+
+app.get('/api/snipe/image/:messageId/:index', async (req, res) => {
+  const messageId = req.params.messageId;
+  const index = Number.parseInt(req.params.index, 10);
+  if (!messageId || Number.isNaN(index) || index < 0) {
+    res.status(400).send('Invalid attachment reference');
+    return;
+  }
+
+  const att = selfBotManager.getSnipeAttachmentData(messageId, index);
+  if (!att) {
+    res.status(404).send('Attachment not found');
+    return;
+  }
+
+  if (att.buffer && att.buffer.byteLength > 0) {
+    res.setHeader('Content-Type', att.contentType || 'image/png');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.send(att.buffer);
+    return;
+  }
+
+  if (att.url) {
+    try {
+      const upstream = await fetch(att.url, { signal: AbortSignal.timeout(5000) });
+      if (upstream.ok) {
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        res.setHeader('Content-Type', upstream.headers.get('content-type') || att.contentType || 'image/png');
+        res.setHeader('Cache-Control', 'private, max-age=600');
+        res.send(buf);
+        return;
+      }
+    } catch {
+      // fall through to 404
+    }
+  }
+
+  res.status(404).send('Image no longer available');
+});
+
+app.post('/api/snipe/clear', (req, res) => {
+  const channelId = typeof req.body?.channelId === 'string' && req.body.channelId.trim()
+    ? req.body.channelId.trim()
+    : undefined;
+  selfBotManager.clearSnipedMessages(channelId);
+  res.json({ ok: true, state: selfBotManager.getPublicState() });
+});
+
 async function startServer() {
   const PORT = Number(process.env.PORT || 3000);
   const isProd = process.env.NODE_ENV === 'production';
