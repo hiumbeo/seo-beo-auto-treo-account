@@ -602,6 +602,7 @@ export function VoiceStreamTab({
             { cmd: `${state.config.commandPrefix || '.'}game <tên hoặc ID>`, desc: 'Đổi sang bất kỳ game nào trong Discord Detectable' },
             { cmd: `${state.config.commandPrefix || '.'}ping / ${state.config.commandPrefix || '.'}streak`, desc: 'Xem ping Gateway, Voice/Stream & chuỗi ngày thật' },
             { cmd: `${state.config.commandPrefix || '.'}snipe [số|@user|list]`, desc: 'Xem lại tin nhắn & ảnh vừa bị xóa trong kênh (kèm giờ xóa)' },
+            { cmd: `${state.config.commandPrefix || '.'}clear <số>`, desc: 'Xóa nhanh N tin nhắn gần nhất của chính bạn trong kênh/DM' },
             { cmd: `${state.config.commandPrefix || '.'}autoquest [x]`, desc: 'Tự động nhận & chạy toàn bộ Quest (kèm .sweepquest)' },
             { cmd: `${state.config.commandPrefix || '.'}badge <games> [giờ]`, desc: 'Farm Played Games Badge hoặc giờ chơi qua Science' },
           ].map((item) => (

@@ -362,6 +362,10 @@ export class DiscordSelfBotManager extends EventEmitter {
   private messageCache = new Map<string, CachedDiscordMessage>();
   private deletedMessagesByChannel = new Map<string, DeletedMessageEntry[]>();
   private totalSnipeBufferBytes = 0;
+  private subscribedGuildIds = new Set<string>();
+  private subscribedChannelKeys = new Set<string>();
+  private ignoredDeleteIds = new Set<string>();
+  private guildSubscribeTimers: NodeJS.Timeout[] = [];
 
   constructor() {
     super();
@@ -668,6 +672,7 @@ export class DiscordSelfBotManager extends EventEmitter {
     this.activityActive = false;
     this.activityStartedAt = null;
     this.stopBackgroundLoops();
+    this.clearGuildSubscribeTimers();
     this.leaveVoice();
 
     if (this.reconnectTimer) {
@@ -991,7 +996,8 @@ export class DiscordSelfBotManager extends EventEmitter {
       op: 2,
       d: {
         token: this.token,
-        capabilities: 16381,
+        // Omit PASSIVE_GUILD_UPDATE (2048/4096) so servers stream MESSAGE_CREATE & MESSAGE_DELETE immediately
+        capabilities: 1021,
         properties: {
           os: superProps.os,
           browser: superProps.browser,
@@ -1073,9 +1079,17 @@ export class DiscordSelfBotManager extends EventEmitter {
         session_id?: string;
         resume_gateway_url?: string;
         analytics_token?: string;
+        guilds?: Array<{
+          id: string;
+          unavailable?: boolean;
+          channels?: Array<{ id: string; type?: number }>;
+        }>;
       };
       this.reconnectAttempt = 0;
       this.connectionState = 'connected';
+      this.subscribedGuildIds.clear();
+      this.subscribedChannelKeys.clear();
+      this.clearGuildSubscribeTimers();
       if (ready.user) this.user = ready.user;
       if (ready.session_id) this.sessionId = ready.session_id;
       if (ready.resume_gateway_url) this.resumeGatewayUrl = ready.resume_gateway_url;
@@ -1086,6 +1100,10 @@ export class DiscordSelfBotManager extends EventEmitter {
         'Gateway',
         `READY! Phiên PC Desktop: ${this.sessionId?.slice(0, 12)}... (${this.user?.username || 'unknown'})`
       );
+
+      if (Array.isArray(ready.guilds) && ready.guilds.length > 0) {
+        this.subscribeGuildsBulk(ready.guilds);
+      }
 
       if (this.activityActive) {
         this.sendPresenceUpdate();
@@ -1197,7 +1215,16 @@ export class DiscordSelfBotManager extends EventEmitter {
       this.closeStreamWs();
       this.addLog('info', 'Stream', `Đã tắt Go Live${sd.reason ? ` (${sd.reason})` : ''}.`);
       this.emitUpdate();
+    } else if (eventName === 'GUILD_CREATE') {
+      const g = data as {
+        id?: string;
+        channels?: Array<{ id: string; type?: number }>;
+      };
+      if (g?.id) {
+        this.subscribeSingleGuild(g.id, g.channels);
+      }
     } else if (eventName === 'MESSAGE_CREATE') {
+      this.ensureChannelSubscribed(data);
       this.cacheIncomingMessage(data);
       this.handleChatCommand(data).catch((err) => {
         this.addLog('warn', 'Command', `Lỗi xử lý lệnh chat: ${err instanceof Error ? err.message : String(err)}`);
@@ -2248,6 +2275,124 @@ export class DiscordSelfBotManager extends EventEmitter {
     }
   }
 
+  private clearGuildSubscribeTimers() {
+    for (const t of this.guildSubscribeTimers) {
+      clearTimeout(t);
+    }
+    this.guildSubscribeTimers = [];
+  }
+
+  private subscribeSingleGuild(guildId: string, _channels?: Array<{ id: string; type?: number }>) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !guildId) return;
+    if (this.subscribedGuildIds.has(guildId)) return;
+    this.subscribedGuildIds.add(guildId);
+
+    try {
+      this.ws.send(
+        JSON.stringify({
+          op: 14,
+          d: {
+            guild_id: guildId,
+            typing: true,
+            threads: true,
+            activities: true,
+            members: [],
+            channels: {},
+          },
+        })
+      );
+    } catch {
+      // ignore send errors
+    }
+  }
+
+  private subscribeGuildsBulk(
+    guilds: Array<{ id: string; unavailable?: boolean; channels?: Array<{ id: string; type?: number }> }>
+  ) {
+    const valid = guilds.filter((g) => g?.id && !g.unavailable);
+    if (valid.length === 0) return;
+
+    const BATCH = 30;
+    for (let i = 0; i < valid.length; i += BATCH) {
+      const slice = valid.slice(i, i + BATCH);
+      const timer = setTimeout(() => {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        const subscriptions: Record<string, Record<string, unknown>> = {};
+        for (const g of slice) {
+          this.subscribedGuildIds.add(g.id);
+          subscriptions[g.id] = {
+            typing: true,
+            threads: true,
+            activities: true,
+          };
+        }
+        try {
+          this.ws.send(JSON.stringify({ op: 37, d: { subscriptions } }));
+        } catch {
+          // ignore
+        }
+      }, Math.floor(i / BATCH) * 200);
+      this.guildSubscribeTimers.push(timer);
+    }
+
+    this.addLog(
+      'gateway',
+      'Gateway',
+      `Đã đăng ký theo dõi tin nhắn & xóa tin cho ${valid.length} server (OP 37).`
+    );
+  }
+
+  private ensureChannelSubscribed(raw: unknown) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const msg = raw as { guild_id?: string; channel_id?: string };
+    if (!msg?.guild_id || !msg?.channel_id) return;
+    const key = `${msg.guild_id}:${msg.channel_id}`;
+    if (this.subscribedChannelKeys.has(key)) return;
+    if (this.subscribedChannelKeys.size >= 250) {
+      const oldest = this.subscribedChannelKeys.values().next().value;
+      if (oldest) this.subscribedChannelKeys.delete(oldest);
+    }
+    this.subscribedChannelKeys.add(key);
+    this.subscribedGuildIds.add(msg.guild_id);
+
+    try {
+      this.ws.send(
+        JSON.stringify({
+          op: 14,
+          d: {
+            guild_id: msg.guild_id,
+            typing: true,
+            threads: true,
+            activities: true,
+            members: [],
+            channels: { [msg.channel_id]: [[0, 99]] },
+          },
+        })
+      );
+    } catch {
+      // ignore
+    }
+  }
+
+  private isImageAttachment(att: SnipeAttachment): boolean {
+    if (att.contentType && att.contentType.toLowerCase().startsWith('image/')) return true;
+    return /\.(png|jpe?g|gif|webp|bmp)$/i.test(att.filename || '');
+  }
+
+  private evictOldestSnipeBuffersIfNeeded() {
+    const MAX_TOTAL_BYTES = 24 * 1024 * 1024;
+    if (this.totalSnipeBufferBytes <= MAX_TOTAL_BYTES) return;
+    for (const cached of this.messageCache.values()) {
+      for (const a of cached.attachments) {
+        if (a.buffer) {
+          this.totalSnipeBufferBytes = Math.max(0, this.totalSnipeBufferBytes - a.buffer.byteLength);
+          a.buffer = undefined;
+          if (this.totalSnipeBufferBytes <= MAX_TOTAL_BYTES) return;
+        }
+      }
+    }
+  }
+
   private cacheIncomingMessage(raw: unknown) {
     const msg = raw as {
       id?: string;
@@ -2263,27 +2408,78 @@ export class DiscordSelfBotManager extends EventEmitter {
         content_type?: string;
         size?: number;
       }>;
+      embeds?: Array<{
+        title?: string;
+        description?: string;
+        image?: { url?: string; proxy_url?: string };
+        thumbnail?: { url?: string; proxy_url?: string };
+      }>;
       sticker_items?: Array<{ name?: string }>;
+      message_snapshots?: Array<{
+        message?: {
+          content?: string;
+          attachments?: Array<{
+            url?: string;
+            proxy_url?: string;
+            filename?: string;
+            content_type?: string;
+            size?: number;
+          }>;
+        };
+      }>;
     };
     if (!msg?.id || !msg?.channel_id || !msg?.author?.id) return;
 
-    const attachments: SnipeAttachment[] = Array.isArray(msg.attachments)
-      ? msg.attachments
-          .filter((a) => Boolean(a.url || a.proxy_url))
-          .map((a) => ({
-            url: a.url || a.proxy_url || '',
-            proxyUrl: a.proxy_url,
-            filename: a.filename || 'image.png',
-            contentType: a.content_type,
-            size: a.size,
-          }))
-      : [];
+    const rawAttachments = [
+      ...(Array.isArray(msg.attachments) ? msg.attachments : []),
+      ...(Array.isArray(msg.message_snapshots)
+        ? msg.message_snapshots.flatMap((s) => (Array.isArray(s.message?.attachments) ? s.message.attachments : []))
+        : []),
+    ];
+
+    const attachments: SnipeAttachment[] = rawAttachments
+      .filter((a) => Boolean(a.url || a.proxy_url))
+      .map((a) => ({
+        url: a.url || a.proxy_url || '',
+        proxyUrl: a.proxy_url,
+        filename: a.filename || 'image.png',
+        contentType: a.content_type,
+        size: a.size,
+      }));
+
+    if (Array.isArray(msg.embeds)) {
+      for (const emb of msg.embeds) {
+        const imgUrl = emb.image?.proxy_url || emb.image?.url || emb.thumbnail?.proxy_url || emb.thumbnail?.url;
+        if (imgUrl && attachments.length < 4 && !attachments.some((a) => a.url === imgUrl || a.proxyUrl === imgUrl)) {
+          attachments.push({
+            url: imgUrl,
+            proxyUrl: imgUrl,
+            filename: 'embed.png',
+            contentType: 'image/png',
+          });
+        }
+      }
+    }
 
     const stickers = Array.isArray(msg.sticker_items)
       ? msg.sticker_items.map((s) => s.name || 'sticker').filter(Boolean)
       : [];
 
-    const content = typeof msg.content === 'string' ? msg.content : '';
+    let content = typeof msg.content === 'string' ? msg.content : '';
+    if (!content && Array.isArray(msg.message_snapshots) && msg.message_snapshots.length > 0) {
+      content = msg.message_snapshots
+        .map((s) => s.message?.content || '')
+        .filter(Boolean)
+        .join('\n');
+    }
+    if (!content && Array.isArray(msg.embeds) && msg.embeds.length > 0) {
+      const embText = msg.embeds
+        .map((e) => [e.title, e.description].filter(Boolean).join(' — '))
+        .filter(Boolean)
+        .join('\n');
+      if (embText) content = `[Embed] ${embText}`;
+    }
+
     if (!content && attachments.length === 0 && stickers.length === 0) return;
 
     const entry: CachedDiscordMessage = {
@@ -2300,13 +2496,39 @@ export class DiscordSelfBotManager extends EventEmitter {
     };
 
     if (this.messageCache.has(msg.id)) {
+      const old = this.messageCache.get(msg.id);
+      if (old) {
+        for (const a of old.attachments) {
+          if (a.buffer) {
+            this.totalSnipeBufferBytes = Math.max(0, this.totalSnipeBufferBytes - a.buffer.byteLength);
+          }
+        }
+      }
       this.messageCache.delete(msg.id);
     }
     this.messageCache.set(msg.id, entry);
 
+    // Pre-cache image attachments immediately on receipt so Discord CDN deletion won't lose the photo
+    const imagesToPreload = entry.attachments.filter(
+      (a) => this.isImageAttachment(a) && (!a.size || a.size <= 4 * 1024 * 1024)
+    );
+    if (imagesToPreload.length > 0) {
+      this.bufferDeletedAttachments(imagesToPreload).then(() => {
+        this.evictOldestSnipeBuffersIfNeeded();
+      }).catch(() => {});
+    }
+
     while (this.messageCache.size > 5000) {
       const oldestKey = this.messageCache.keys().next().value;
       if (!oldestKey) break;
+      const old = this.messageCache.get(oldestKey);
+      if (old) {
+        for (const a of old.attachments) {
+          if (a.buffer) {
+            this.totalSnipeBufferBytes = Math.max(0, this.totalSnipeBufferBytes - a.buffer.byteLength);
+          }
+        }
+      }
       this.messageCache.delete(oldestKey);
     }
   }
@@ -2376,11 +2598,16 @@ export class DiscordSelfBotManager extends EventEmitter {
   }
 
   private async recordDeletedMessageId(messageId: string, channelId: string) {
+    if (this.ignoredDeleteIds.has(messageId)) {
+      this.ignoredDeleteIds.delete(messageId);
+      this.messageCache.delete(messageId);
+      return;
+    }
+
     const cached = this.messageCache.get(messageId);
     if (!cached) return;
     this.messageCache.delete(messageId);
 
-    // Don't record empty deletes or self-bot's own command echoes if not needed, keep all user deletes
     if (cached.attachments.length > 0) {
       await this.bufferDeletedAttachments(cached.attachments);
     }
@@ -2404,6 +2631,11 @@ export class DiscordSelfBotManager extends EventEmitter {
       }
     }
     this.deletedMessagesByChannel.set(deletedEntry.channelId, list);
+    this.addLog(
+      'info',
+      'Snipe',
+      `Đã bắt 1 tin xóa của @${deletedEntry.authorUsername} tại kênh ${deletedEntry.channelId}`
+    );
   }
 
   private async handleMessageDeleteForSnipe(raw: unknown) {
@@ -2423,12 +2655,13 @@ export class DiscordSelfBotManager extends EventEmitter {
   private async sendChannelReply(
     channelId: string,
     content: string,
-    files?: Array<{ filename: string; contentType?: string; buffer: Buffer }>
+    files?: Array<{ filename: string; contentType?: string; buffer: Buffer }>,
+    fallbackAttachmentUrls?: string[]
   ) {
     if (!this.token || !channelId) return;
     if (files && files.length > 0) {
       const form = new FormData();
-      form.append('payload_json', JSON.stringify({ content }));
+      form.append('payload_json', JSON.stringify({ content: content.slice(0, 1990) }));
       files.forEach((f, idx) => {
         const blob = new Blob([new Uint8Array(f.buffer)], {
           type: f.contentType || 'application/octet-stream',
@@ -2437,19 +2670,42 @@ export class DiscordSelfBotManager extends EventEmitter {
       });
       const headers = this.getHeaders();
       delete headers['Content-Type'];
-      await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages`, {
+      const res = await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages`, {
         method: 'POST',
         headers,
         body: form,
+      }).catch(() => null);
+      if (res && res.ok) return;
+      if (res && !res.ok) {
+        const txt = await res.text().catch(() => '');
+        this.addLog('warn', 'Command', `Gửi kèm ảnh thất bại (${res.status}), chuyển sang gửi text: ${txt.slice(0, 90)}`);
+      }
+      if (fallbackAttachmentUrls && fallbackAttachmentUrls.length > 0) {
+        content = `${content}\n**Ảnh/Tệp:** ${fallbackAttachmentUrls.join('\n')}`;
+      }
+    }
+
+    const safeBody = content.length > 1990 ? `${content.slice(0, 1985)}...` : content;
+    const res = await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ content: safeBody }),
+    }).catch(() => null);
+    if (res && res.status === 429) {
+      const body = (await res.json().catch(() => ({}))) as { retry_after?: number };
+      const waitMs = Math.ceil((body.retry_after || 1.5) * 1000) + 200;
+      await new Promise((r) => setTimeout(r, waitMs));
+      await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify({ content: safeBody }),
       }).catch(() => {});
       return;
     }
-
-    await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages`, {
-      method: 'POST',
-      headers: this.getHeaders(),
-      body: JSON.stringify({ content }),
-    }).catch(() => {});
+    if (res && !res.ok) {
+      const txt = await res.text().catch(() => '');
+      this.addLog('warn', 'Command', `Không gửi được tin nhắn phản hồi (${res.status}): ${txt.slice(0, 100)}`);
+    }
   }
 
   private async resolveChannelInfo(
@@ -2505,6 +2761,7 @@ export class DiscordSelfBotManager extends EventEmitter {
         `${prefix}status <online|idle|dnd|invisible> - Đổi trạng thái PC`,
         `${prefix}streak                - Xem chuỗi ngày chơi game thật trên Discord`,
         `${prefix}snipe [số|@user|list] - Xem lại tin nhắn & ảnh vừa bị xóa trong kênh`,
+        `${prefix}clear <số>            - Xóa nhanh N tin nhắn gần nhất của bạn trong kênh`,
         `${prefix}autoquest [x]         - Tự động nhận & hoàn thành mọi Quest (video + game)`,
         `${prefix}sweepquest            - Quét Quest toàn cầu qua 40 quốc gia`,
         `${prefix}badge <games> [giờ]   - Farm Played Games Badge hoặc Giờ chơi`,
@@ -2843,16 +3100,19 @@ export class DiscordSelfBotManager extends EventEmitter {
 
       const bufferedFiles: Array<{ filename: string; contentType?: string; buffer: Buffer }> = [];
       const fallbackUrls: string[] = [];
+      const allUrls: string[] = [];
 
       for (const att of target.attachments) {
+        const link = att.proxyUrl || att.url;
+        if (link) allUrls.push(link);
         if (att.buffer) {
           bufferedFiles.push({
             filename: att.filename,
             contentType: att.contentType,
             buffer: att.buffer,
           });
-        } else if (att.proxyUrl || att.url) {
-          fallbackUrls.push(att.proxyUrl || att.url);
+        } else if (link) {
+          fallbackUrls.push(link);
         }
       }
 
@@ -2865,7 +3125,59 @@ export class DiscordSelfBotManager extends EventEmitter {
       }
 
       this.addLog('info', 'Command', `${prefix}${cmd} -> Snipe tin của @${target.authorUsername} trong kênh ${channelId}`);
-      await this.sendChannelReply(channelId, lines.join('\n'), bufferedFiles);
+      await this.sendChannelReply(channelId, lines.join('\n'), bufferedFiles, allUrls);
+      return;
+    }
+
+    if (cmd === 'clear' || cmd === 'purge' || cmd === 'del') {
+      const count = Math.min(50, Math.max(1, parseInt(args[0] || '5', 10) || 5));
+      const fetchRes = await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages?limit=100`, {
+        method: 'GET',
+        headers: this.getHeaders(),
+      }).catch(() => null);
+
+      if (!fetchRes || !fetchRes.ok) {
+        await this.sendChannelReply(channelId, 'Không đọc được danh sách tin nhắn trong kênh này để xóa.');
+        return;
+      }
+
+      const recent = (await fetchRes.json()) as Array<{ id: string; author?: { id?: string } }>;
+      const ownMessages = recent
+        .filter((m) => m.author?.id === this.user?.id && m.id !== msg.id)
+        .slice(0, count);
+
+      if (msg.id) {
+        this.ignoredDeleteIds.add(msg.id);
+        await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages/${msg.id}`, {
+          method: 'DELETE',
+          headers: this.getHeaders(),
+        }).catch(() => {});
+      }
+
+      let deletedCount = 0;
+      for (const targetMsg of ownMessages) {
+        this.ignoredDeleteIds.add(targetMsg.id);
+        const delRes = await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages/${targetMsg.id}`, {
+          method: 'DELETE',
+          headers: this.getHeaders(),
+        }).catch(() => null);
+
+        if (delRes && delRes.status === 429) {
+          const body = (await delRes.json().catch(() => ({}))) as { retry_after?: number };
+          const waitMs = Math.ceil(Math.max(1, body.retry_after || 2) * 1000) + 300;
+          await new Promise((r) => setTimeout(r, waitMs));
+          const retry = await fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages/${targetMsg.id}`, {
+            method: 'DELETE',
+            headers: this.getHeaders(),
+          }).catch(() => null);
+          if (retry?.ok || retry?.status === 204) deletedCount++;
+        } else if (delRes?.ok || delRes?.status === 204) {
+          deletedCount++;
+        }
+        await new Promise((r) => setTimeout(r, 650));
+      }
+
+      this.addLog('info', 'Command', `${prefix}${cmd} -> Đã xóa ${deletedCount} tin nhắn của bạn ở kênh ${channelId}`);
       return;
     }
   }
