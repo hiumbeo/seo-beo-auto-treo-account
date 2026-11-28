@@ -17,6 +17,11 @@ import {
   type QuestRunnerPublicState,
   type RawDiscordQuest,
 } from './questAndBadge.ts';
+import {
+  VoiceRecorderService,
+  type VoiceRecorderPublicState,
+  type VoiceRecordingClipPublic,
+} from './voiceRecorder.ts';
 
 export type DiscordStatus = 'online' | 'idle' | 'dnd' | 'invisible';
 
@@ -56,6 +61,7 @@ export interface ActivityConfig {
   questBoostRatio: number;
   questAutoBackToVN: boolean;
   snipeWebhookUrl: string;
+  voiceWebhookUrl: string;
 }
 
 export interface RobloxAccountPublic {
@@ -187,6 +193,7 @@ export interface BotPublicState {
   badgeSpoof: BadgeSpoofPublicState;
   logs: LogEntry[];
   snipedMessages: SnipedMessagePublic[];
+  voiceRecorder: VoiceRecorderPublicState;
 }
 
 interface SnipeAttachment {
@@ -294,6 +301,7 @@ export const ROBLOX_PRESET: ActivityConfig = {
   questBoostRatio: 2.5,
   questAutoBackToVN: true,
   snipeWebhookUrl: '',
+  voiceWebhookUrl: '',
 };
 
 function buildSuperPropertiesObj() {
@@ -396,11 +404,13 @@ export class DiscordSelfBotManager extends EventEmitter {
   private deletedMessagesByChannel = new Map<string, DeletedMessageEntry[]>();
   private guildNameCache = new Map<string, string>();
   private channelNameCache = new Map<string, { name: string; guildId?: string }>();
+  private userLabelCache = new Map<string, string>();
   private totalSnipeBufferBytes = 0;
   private subscribedGuildIds = new Set<string>();
   private subscribedChannelKeys = new Set<string>();
   private ignoredDeleteIds = new Set<string>();
   private guildSubscribeTimers: NodeJS.Timeout[] = [];
+  private voiceRecorder: VoiceRecorderService;
 
   constructor() {
     super();
@@ -429,6 +439,37 @@ export class DiscordSelfBotManager extends EventEmitter {
       },
       onLog: (level, source, msg) => this.addLog(level, source, msg),
       onStateChange: () => this.emitUpdate(),
+    });
+    this.voiceRecorder = new VoiceRecorderService({
+      getGatewayConnected: () => Boolean(this.ws && this.ws.readyState === WebSocket.OPEN),
+      sendGatewayPayload: (payload) => {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+        try {
+          this.ws.send(JSON.stringify(payload));
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      getWebhookUrl: () => (this.config.voiceWebhookUrl || this.config.snipeWebhookUrl || '').trim(),
+      resolveChannelMeta: (channelId) => {
+        const ch = this.channelNameCache.get(channelId);
+        const guildId = ch?.guildId;
+        const guildName = guildId ? this.guildNameCache.get(guildId) : undefined;
+        return { channelName: ch?.name, guildId, guildName };
+      },
+      resolveUserLabel: (userId) => this.userLabelCache.get(userId) || userId,
+      onLog: (level, source, msg) => this.addLog(level, source, msg),
+      onStateChange: () => this.emitUpdate(),
+      onRecordingFinished: ({ leaveVoiceAfter }) => {
+        if (leaveVoiceAfter) {
+          this.voiceConnected = false;
+          this.voiceDesiredActive = false;
+          this.voiceSessionId = null;
+          this.voiceEndpoint = null;
+          this.emitUpdate();
+        }
+      },
     });
     this.loadPersistedState();
   }
@@ -533,6 +574,9 @@ export class DiscordSelfBotManager extends EventEmitter {
       if (process.env.SNIPE_WEBHOOK_URL?.trim() && !this.config.snipeWebhookUrl) {
         this.config.snipeWebhookUrl = process.env.SNIPE_WEBHOOK_URL.trim();
       }
+      if (process.env.VOICE_WEBHOOK_URL?.trim() && !this.config.voiceWebhookUrl) {
+        this.config.voiceWebhookUrl = process.env.VOICE_WEBHOOK_URL.trim();
+      }
       this.config.platform = 'desktop';
 
       if (this.robloxProfile) {
@@ -619,6 +663,7 @@ export class DiscordSelfBotManager extends EventEmitter {
       badgeSpoof: this.badgeSpoofer.getState(),
       logs: [...this.logs],
       snipedMessages: this.getSnipedMessages(),
+      voiceRecorder: this.voiceRecorder.getState(),
     };
   }
 
@@ -712,6 +757,7 @@ export class DiscordSelfBotManager extends EventEmitter {
     this.activityStartedAt = null;
     this.stopBackgroundLoops();
     this.clearGuildSubscribeTimers();
+    await this.voiceRecorder.stopRecording({ skipCallback: true, forceLeave: true });
     this.leaveVoice();
 
     if (this.reconnectTimer) {
@@ -1188,7 +1234,23 @@ export class DiscordSelfBotManager extends EventEmitter {
         session_id?: string;
         self_mute?: boolean;
         self_deaf?: boolean;
+        member?: {
+          nick?: string | null;
+          user?: { id?: string; username?: string; global_name?: string | null };
+        };
       };
+      if (vs.user_id && vs.member?.user) {
+        const label =
+          vs.member.nick ||
+          vs.member.user.global_name ||
+          vs.member.user.username;
+        if (label) {
+          this.userLabelCache.set(vs.user_id, `@${vs.member.user.username || label}`);
+        }
+      }
+      if (this.voiceRecorder.isActive()) {
+        this.voiceRecorder.handleGatewayVoiceStateUpdate(data);
+      }
       if (vs.user_id && this.user?.id && vs.user_id !== this.user.id) return;
       if (!vs.channel_id) {
         this.voiceConnected = false;
@@ -1205,16 +1267,21 @@ export class DiscordSelfBotManager extends EventEmitter {
         if (vs.guild_id) this.config.voiceGuildId = vs.guild_id;
         this.config.voiceChannelId = vs.channel_id;
         this.addLog('success', 'Voice', `Đã vào kênh thoại ${vs.channel_id} (session ${this.voiceSessionId?.slice(0, 8)}...).`);
-        if (this.voiceEndpoint && this.voiceSessionId && !this.voiceWs) {
+        if (!this.voiceRecorder.isActive() && this.voiceEndpoint && this.voiceSessionId && !this.voiceWs) {
           this.connectVoiceWs();
         }
       }
       this.emitUpdate();
     } else if (eventName === 'VOICE_SERVER_UPDATE') {
       const srv = data as { token?: string; guild_id?: string; endpoint?: string | null };
+      if (this.voiceRecorder.isActive()) {
+        this.voiceRecorder.handleGatewayVoiceServerUpdate(data);
+      }
       if (!srv.endpoint || !srv.token) return;
       this.voiceEndpoint = srv.endpoint;
-      this.connectVoiceWs(srv.token, srv.guild_id || this.config.voiceGuildId, srv.endpoint);
+      if (!this.voiceRecorder.isActive()) {
+        this.connectVoiceWs(srv.token, srv.guild_id || this.config.voiceGuildId, srv.endpoint);
+      }
       if (this.streamDesiredActive && !this.streamActive) {
         setTimeout(() => this.sendStreamCreate(), 600);
       }
@@ -2013,8 +2080,65 @@ export class DiscordSelfBotManager extends EventEmitter {
     this.emitUpdate();
   }
 
+  public async startVoiceRecording(params: {
+    guildId?: string;
+    channelId?: string;
+    durationSeconds?: number;
+    leaveAfterStop?: boolean;
+    selfMute?: boolean;
+  }): Promise<VoiceRecorderPublicState> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('Gateway chưa kết nối. Hãy khởi chạy bot trước.');
+    }
+    const targetChannelId = (params.channelId || this.config.voiceChannelId || '').trim();
+    if (!targetChannelId) {
+      throw new Error('Cần chọn hoặc dán Voice Channel ID để vào ghi âm.');
+    }
+
+    let targetGuildId = (params.guildId || '').trim();
+    if (!targetGuildId) {
+      const cachedCh = this.channelNameCache.get(targetChannelId);
+      if (cachedCh?.guildId) {
+        targetGuildId = cachedCh.guildId;
+      } else {
+        const chInfo = await this.resolveChannelInfo(targetChannelId);
+        if (chInfo?.guild_id) {
+          targetGuildId = chInfo.guild_id;
+          if (chInfo.name) {
+            this.channelNameCache.set(targetChannelId, { name: chInfo.name, guildId: chInfo.guild_id });
+          }
+        } else if (targetChannelId === this.config.voiceChannelId && this.config.voiceGuildId) {
+          targetGuildId = this.config.voiceGuildId;
+        }
+      }
+    }
+
+    // Close lightweight v4 socket so VoiceRecorderService (@discordjs/voice v8 + DAVE) takes clean ownership
+    this.closeVoiceWs();
+
+    await this.voiceRecorder.startRecording({
+      guildId: targetGuildId,
+      channelId: targetChannelId,
+      durationSeconds: params.durationSeconds,
+      leaveAfterStop: params.leaveAfterStop,
+      selfMute: params.selfMute,
+    });
+    return this.voiceRecorder.getState();
+  }
+
+  public async stopVoiceRecording(forceLeave?: boolean): Promise<VoiceRecordingClipPublic | null> {
+    return this.voiceRecorder.stopRecording({ forceLeave });
+  }
+
+  public getVoiceRecordingAudio(id: string): { buffer: Buffer; filename: string } | null {
+    return this.voiceRecorder.getRecordingAudio(id);
+  }
+
   public leaveVoice() {
     this.stopStreamImage();
+    if (this.voiceRecorder.isActive()) {
+      this.voiceRecorder.stopRecording({ skipCallback: true, forceLeave: true }).catch(() => {});
+    }
     this.voiceDesiredActive = false;
     this.voiceConnected = false;
     this.voiceSessionId = null;
@@ -3044,6 +3168,8 @@ export class DiscordSelfBotManager extends EventEmitter {
         `${prefix}info                  - Xem bảng trạng thái chi tiết Bot/Voice/Stream`,
         `${prefix}join [channel_id]     - Vào kênh thoại (bỏ trống = kênh mặc định / đầu server)`,
         `${prefix}leave                 - Rời kênh thoại`,
+        `${prefix}record [id] [giây]    - Vào voice riêng ghi âm & gửi file WAV về Webhook`,
+        `${prefix}stoprecord            - Dừng ghi âm & gửi file về Webhook ngay`,
         `${prefix}stream [channel_id]   - Vào voice và bật Go Live Stream Ảnh`,
         `${prefix}stopstream            - Tắt Go Live Stream Ảnh`,
         `${prefix}mute / ${prefix}unmute       - Tắt / Bật mic khi đang treo voice`,
@@ -3417,6 +3543,76 @@ export class DiscordSelfBotManager extends EventEmitter {
 
       this.addLog('info', 'Command', `${prefix}${cmd} -> Snipe tin của @${target.authorUsername} trong kênh ${channelId}`);
       await this.sendChannelReply(channelId, lines.join('\n'), bufferedFiles, allUrls);
+      return;
+    }
+
+    if (cmd === 'record' || cmd === 'rec' || cmd === 'ghiam') {
+      let targetChannelId = '';
+      let durationSeconds = 0;
+
+      for (const a of args) {
+        const cleaned = a.replace(/[<#>]/g, '').trim();
+        if (!cleaned) continue;
+        if (/^\d{15,22}$/.test(cleaned) && !targetChannelId) {
+          targetChannelId = cleaned;
+        } else if (/^\d{1,4}$/.test(cleaned) && !durationSeconds) {
+          durationSeconds = Math.min(3600, Math.max(5, parseInt(cleaned, 10)));
+        }
+      }
+
+      let targetGuildId = '';
+      if (!targetChannelId) {
+        if (this.config.voiceChannelId) {
+          targetChannelId = this.config.voiceChannelId;
+          targetGuildId = this.config.voiceGuildId;
+        } else if (msg.guild_id) {
+          const channels = await this.fetchGuildVoiceChannels(msg.guild_id).catch(() => []);
+          if (channels.length > 0) {
+            targetGuildId = msg.guild_id;
+            targetChannelId = channels[0].id;
+          }
+        }
+      }
+
+      if (!targetChannelId) {
+        await this.sendChannelReply(
+          channelId,
+          `Dùng \`${prefix}record <Voice_Channel_ID> [giây]\` để bot vào phòng ghi âm.`
+        );
+        return;
+      }
+
+      try {
+        await this.startVoiceRecording({
+          guildId: targetGuildId,
+          channelId: targetChannelId,
+          durationSeconds,
+          leaveAfterStop: durationSeconds > 0,
+          selfMute: true,
+        });
+        await this.sendChannelReply(
+          channelId,
+          `Đang ghi âm tại <#${targetChannelId}>${durationSeconds > 0 ? ` (${durationSeconds}s)` : ''} -> xong sẽ gửi về Webhook.`
+        );
+      } catch (err) {
+        await this.sendChannelReply(
+          channelId,
+          `Không ghi âm được: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      return;
+    }
+
+    if (cmd === 'stoprecord' || cmd === 'stoprec' || cmd === 'saverec') {
+      const clip = await this.stopVoiceRecording(true);
+      if (!clip) {
+        await this.sendChannelReply(channelId, 'Không có bản ghi âm nào đang chạy hoặc phòng chưa có ai nói.');
+      } else {
+        await this.sendChannelReply(
+          channelId,
+          `Đã dừng ghi âm (\`${clip.durationSeconds}s\`)${clip.webhookSent ? ' và gửi về Webhook.' : '.'}`
+        );
+      }
       return;
     }
 

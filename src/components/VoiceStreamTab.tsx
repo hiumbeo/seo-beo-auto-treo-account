@@ -1,15 +1,20 @@
 import { useEffect, useState } from 'react';
 import {
+  Check,
+  Download,
   Image as ImageIcon,
+  Mic,
   MicOff,
   PhoneOff,
   Radio,
   RefreshCw,
   RotateCcw,
+  Square,
   Terminal,
   Upload,
   Volume2,
   VolumeX,
+  Webhook,
 } from 'lucide-react';
 import type { ActivityConfig, BotPublicState } from '../types';
 
@@ -79,16 +84,26 @@ export function VoiceStreamTab({
   const [loadingChannels, setLoadingChannels] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
 
+  const [recChannelId, setRecChannelId] = useState(state.config.voiceChannelId || '');
+  const [recGuildId, setRecGuildId] = useState(state.config.voiceGuildId || '');
+  const [recDuration, setRecDuration] = useState<number>(60);
+  const [recLeaveAfter, setRecLeaveAfter] = useState<boolean>(true);
+  const [voiceWebhookInput, setVoiceWebhookInput] = useState(state.config.voiceWebhookUrl || '');
+
   useEffect(() => {
     if (state.config.voiceGuildId && !guildId) setGuildId(state.config.voiceGuildId);
     if (state.config.voiceChannelId && !channelId) setChannelId(state.config.voiceChannelId);
+    if (state.config.voiceChannelId && !recChannelId) setRecChannelId(state.config.voiceChannelId);
+    if (state.config.voiceGuildId && !recGuildId) setRecGuildId(state.config.voiceGuildId);
     setSelfMute(state.config.voiceSelfMute);
     setSelfDeaf(state.config.voiceSelfDeaf);
+    setVoiceWebhookInput(state.config.voiceWebhookUrl || '');
   }, [
     state.config.voiceGuildId,
     state.config.voiceChannelId,
     state.config.voiceSelfMute,
     state.config.voiceSelfDeaf,
+    state.config.voiceWebhookUrl,
   ]);
 
   const loadGuilds = async () => {
@@ -249,6 +264,73 @@ export function VoiceStreamTab({
       setBusy(null);
     }
   };
+
+  const handleStartRecord = async () => {
+    const targetChannel = (recChannelId || channelId).trim();
+    const targetGuild = (recChannelId ? recGuildId : guildId).trim();
+    if (!targetChannel) {
+      onError('Vui lòng chọn hoặc dán Voice Channel ID để ghi âm.');
+      return;
+    }
+    setBusy('recStart');
+    try {
+      const res = await fetch('/api/voice/record/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          guildId: targetGuild || undefined,
+          channelId: targetChannel,
+          durationSeconds: recDuration,
+          leaveAfterStop: recLeaveAfter,
+          selfMute: true,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) throw new Error(json.error || 'Không thể vào phòng ghi âm.');
+      onStateChange(json.state);
+      onNotify(`Đang ghi âm Voice phòng ${targetChannel}...`);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : 'Lỗi bắt đầu ghi âm.');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleStopRecord = async () => {
+    setBusy('recStop');
+    try {
+      const res = await fetch('/api/voice/record/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forceLeave: recLeaveAfter }),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) throw new Error(json.error || 'Không thể dừng ghi âm.');
+      onStateChange(json.state);
+      if (json.clip?.webhookSent) {
+        onNotify(`Đã lưu & gửi file ghi âm (${json.clip.durationSeconds}s) về Webhook.`);
+      } else if (json.clip) {
+        onNotify(`Đã lưu bản ghi âm (${json.clip.durationSeconds}s) trên web.`);
+      } else {
+        onNotify('Đã dừng ghi âm (chưa phát hiện giọng nói trong phòng).');
+      }
+    } catch (err) {
+      onError(err instanceof Error ? err.message : 'Lỗi dừng ghi âm.');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleSaveVoiceWebhook = async () => {
+    setBusy('saveWebhook');
+    try {
+      await onUpdateConfig({ voiceWebhookUrl: voiceWebhookInput.trim() });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const rec = state.voiceRecorder;
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -555,6 +637,241 @@ export function VoiceStreamTab({
       <div className="lg:col-span-12 bg-[#111622] border border-[#232C3F] rounded-lg overflow-hidden">
         <div className="px-5 py-4 border-b border-[#232C3F] flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-2.5">
+            <Mic className="w-4 h-4 text-rose-400" />
+            <div>
+              <h2 className="text-base font-semibold text-white">
+                Join Voice Riêng &amp; Ghi Âm (DAVE E2EE -&gt; Webhook)
+              </h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Tự động vào phòng thoại riêng (hoặc DM Call), giải mã Voice v8 + DAVE E2EE, trộn giọng mọi người nói thành file WAV 24kHz và gửi về Webhook (tự tách chunk mỗi 3 phút nếu ghi dài).
+              </p>
+            </div>
+          </div>
+
+          <span
+            className={`text-xs font-mono px-2.5 py-1 rounded border ${
+              rec?.recording
+                ? 'bg-rose-950/60 border-rose-700/60 text-rose-300'
+                : 'bg-[#090C12] border-[#232C3F] text-slate-400'
+            }`}
+          >
+            {rec?.status === 'connecting'
+              ? 'Đang kết nối Voice v8/DAVE...'
+              : rec?.status === 'recording'
+              ? `ĐANG GHI ÂM · ${rec.elapsedSeconds}s (${(rec.estimatedBytes / 1024).toFixed(0)} KB)`
+              : rec?.status === 'uploading'
+              ? 'Đang xử lý & gửi Webhook...'
+              : 'Sẵn sàng ghi âm'}
+          </span>
+        </div>
+
+        <div className="p-5 space-y-5">
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
+            <div className="md:col-span-4">
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                Voice Channel ID cần ghi âm
+              </label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={recChannelId}
+                  onChange={(e) => setRecChannelId(e.target.value)}
+                  placeholder="Dán ID kênh thoại hoặc DM Call..."
+                  className="flex-1 bg-[#090C12] border border-[#232C3F] focus:border-[#5865F2] rounded-md px-3 py-2 text-xs font-mono text-white placeholder:text-slate-600 outline-none"
+                />
+                {channelId && recChannelId !== channelId && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRecChannelId(channelId);
+                      setRecGuildId(guildId);
+                    }}
+                    className="px-2.5 py-2 text-[11px] bg-[#182032] hover:bg-[#222D45] border border-[#2C374F] text-slate-300 rounded-md whitespace-nowrap"
+                  >
+                    Lấy kênh trên
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="md:col-span-3">
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                Guild ID (bỏ trống tự dò / DM)
+              </label>
+              <input
+                type="text"
+                value={recGuildId}
+                onChange={(e) => setRecGuildId(e.target.value)}
+                placeholder="Tự nhận diện theo Channel ID..."
+                className="w-full bg-[#090C12] border border-[#232C3F] focus:border-[#5865F2] rounded-md px-3 py-2 text-xs font-mono text-white placeholder:text-slate-600 outline-none"
+              />
+            </div>
+
+            <div className="md:col-span-3">
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                Thời lượng ghi âm tự động
+              </label>
+              <select
+                value={recDuration}
+                onChange={(e) => setRecDuration(Number(e.target.value))}
+                className="w-full bg-[#090C12] border border-[#232C3F] focus:border-[#5865F2] rounded-md px-3 py-2 text-xs text-white outline-none"
+              >
+                <option value={0}>Ghi liên tục (Dừng thủ công)</option>
+                <option value={30}>30 giây rồi gửi Webhook</option>
+                <option value={60}>60 giây rồi gửi Webhook</option>
+                <option value={120}>2 phút rồi gửi Webhook</option>
+                <option value={180}>3 phút rồi gửi Webhook</option>
+              </select>
+            </div>
+
+            <div className="md:col-span-2 flex items-end">
+              <label className="w-full flex items-center justify-between gap-2 px-3 py-2 bg-[#0D121C] border border-[#1E2638] rounded-md cursor-pointer">
+                <span className="text-xs text-slate-300">Tự rời phòng</span>
+                <input
+                  type="checkbox"
+                  checked={recLeaveAfter}
+                  onChange={(e) => setRecLeaveAfter(e.target.checked)}
+                  className="w-4 h-4 accent-[#5865F2]"
+                />
+              </label>
+            </div>
+          </div>
+
+          <div className="p-3.5 bg-[#0D121C] border border-[#1E2638] rounded-md space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <span className="inline-flex items-center gap-1.5 font-medium text-slate-200">
+                <Webhook className="w-3.5 h-3.5 text-[#5865F2]" />
+                Voice Record Webhook URL (bỏ trống = dùng chung Snipe Webhook)
+              </span>
+              <span className="text-slate-400">
+                {state.config.voiceWebhookUrl || state.config.snipeWebhookUrl
+                  ? 'Đã cấu hình Webhook nhận file WAV'
+                  : 'Chưa gắn Webhook (vẫn nghe/tải được ở dưới)'}
+              </span>
+            </div>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                type="text"
+                value={voiceWebhookInput}
+                onChange={(e) => setVoiceWebhookInput(e.target.value)}
+                placeholder="https://discord.com/api/webhooks/... (tùy chọn riêng cho Voice)"
+                className="flex-1 bg-[#090C12] border border-[#232C3F] focus:border-[#5865F2] rounded-md px-3 py-1.5 text-xs font-mono text-white placeholder:text-slate-600 outline-none"
+              />
+              <button
+                type="button"
+                disabled={busy !== null}
+                onClick={handleSaveVoiceWebhook}
+                className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#182032] hover:bg-[#222D45] border border-[#2C374F] text-white rounded-md transition-colors whitespace-nowrap"
+              >
+                <Check className="w-3.5 h-3.5" />
+                {busy === 'saveWebhook' ? 'Đang lưu...' : 'Lưu Webhook'}
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2.5">
+              {!rec?.recording ? (
+                <button
+                  type="button"
+                  disabled={busy !== null}
+                  onClick={handleStartRecord}
+                  className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white rounded-md transition-colors"
+                >
+                  <Mic className="w-4 h-4" />
+                  {busy === 'recStart' ? 'Đang vào phòng...' : 'Join Voice & Bắt đầu Ghi Âm'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={busy !== null}
+                  onClick={handleStopRecord}
+                  className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold bg-[#5865F2] hover:bg-[#4752C4] disabled:opacity-50 text-white rounded-md transition-colors"
+                >
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                  {busy === 'recStop' ? 'Đang đóng gói WAV...' : 'Dừng & Gửi Webhook Ngay'}
+                </button>
+              )}
+            </div>
+
+            {rec?.recording && (
+              <div className="text-xs font-mono text-slate-300 flex flex-wrap items-center gap-3">
+                <span>Gói âm thanh: {rec.packetsCaptured}</span>
+                <span>·</span>
+                <span>
+                  Người nói: {rec.activeSpeakers.length > 0 ? rec.activeSpeakers.join(', ') : 'Chờ có người nói...'}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {rec?.lastError && (
+            <div className="text-xs text-amber-300 bg-amber-950/40 border border-amber-800/60 rounded-md px-3 py-2">
+              {rec.lastError}
+            </div>
+          )}
+
+          {rec && rec.recentRecordings.length > 0 && (
+            <div className="pt-2 space-y-2.5 border-t border-[#1C2436]">
+              <div className="text-xs font-semibold text-slate-300">
+                Bản ghi âm gần đây ({rec.recentRecordings.length})
+              </div>
+              <div className="space-y-2">
+                {rec.recentRecordings.map((clip) => (
+                  <div
+                    key={clip.id}
+                    className="p-3 bg-[#090C12] border border-[#1E2638] rounded-md flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                  >
+                    <div className="space-y-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-semibold text-white">
+                          {clip.channelName ? `#${clip.channelName}` : `Kênh ${clip.channelId}`}
+                        </span>
+                        {clip.guildName && <span className="text-slate-500">· {clip.guildName}</span>}
+                        <span className="font-mono text-amber-400">{clip.durationSeconds}s</span>
+                        <span className="font-mono text-slate-500">
+                          ({(clip.sizeBytes / 1024).toFixed(0)} KB)
+                        </span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                            clip.webhookSent
+                              ? 'bg-emerald-950/60 text-emerald-400 border border-emerald-800/50'
+                              : 'bg-slate-800/60 text-slate-400'
+                          }`}
+                        >
+                          {clip.webhookSent ? 'Đã gửi Webhook' : 'Lưu cục bộ'}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-400 truncate">
+                        {new Date(clip.startedAt).toLocaleTimeString('vi-VN')} · Người nói:{' '}
+                        {clip.speakers.length > 0
+                          ? clip.speakers.map((s) => s.label).join(', ')
+                          : 'Không rõ'}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 shrink-0">
+                      <audio controls preload="none" src={clip.audioRoute} className="h-8 max-w-[230px]" />
+                      <a
+                        href={clip.audioRoute}
+                        download={`voice-${clip.channelId}-${clip.startedAt}.wav`}
+                        className="p-2 bg-[#182032] hover:bg-[#222D45] border border-[#2C374F] text-slate-200 rounded-md transition-colors"
+                        title="Tải file WAV"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                      </a>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="lg:col-span-12 bg-[#111622] border border-[#232C3F] rounded-lg overflow-hidden">
+        <div className="px-5 py-4 border-b border-[#232C3F] flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-2.5">
             <Terminal className="w-4 h-4 text-[#5865F2]" />
             <div>
               <h2 className="text-base font-semibold text-white">
@@ -595,6 +912,8 @@ export function VoiceStreamTab({
             { cmd: `${state.config.commandPrefix || '.'}help`, desc: 'Hiện bảng danh sách toàn bộ lệnh self-bot' },
             { cmd: `${state.config.commandPrefix || '.'}join [channel_id]`, desc: 'Vào kênh thoại (bỏ trống = kênh đã lưu hoặc kênh đầu server)' },
             { cmd: `${state.config.commandPrefix || '.'}leave`, desc: 'Rời kênh thoại và tắt stream' },
+            { cmd: `${state.config.commandPrefix || '.'}record [id] [giây]`, desc: 'Vào voice riêng ghi âm (DAVE E2EE) rồi gửi file WAV về Webhook' },
+            { cmd: `${state.config.commandPrefix || '.'}stoprecord`, desc: 'Dừng ghi âm ngay và gửi file WAV về Webhook' },
             { cmd: `${state.config.commandPrefix || '.'}stream [channel_id]`, desc: 'Vào voice và phát Go Live Stream Ảnh Tĩnh' },
             { cmd: `${state.config.commandPrefix || '.'}stopstream`, desc: 'Tắt Go Live Stream Ảnh (vẫn ở trong voice)' },
             { cmd: `${state.config.commandPrefix || '.'}mute / ${state.config.commandPrefix || '.'}deaf`, desc: 'Bật/tắt mic & loa khi đang treo voice (kèm unmute/undeaf)' },

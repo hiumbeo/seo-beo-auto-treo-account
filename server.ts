@@ -359,6 +359,53 @@ app.post('/api/voice/stream/image', (req, res) => {
   }
 });
 
+app.post('/api/voice/record/start', async (req, res) => {
+  try {
+    const guildId = typeof req.body?.guildId === 'string' ? req.body.guildId : undefined;
+    const channelId = typeof req.body?.channelId === 'string' ? req.body.channelId : undefined;
+    const durationSeconds = typeof req.body?.durationSeconds === 'number' ? req.body.durationSeconds : undefined;
+    const leaveAfterStop = typeof req.body?.leaveAfterStop === 'boolean' ? req.body.leaveAfterStop : undefined;
+    const selfMute = typeof req.body?.selfMute === 'boolean' ? req.body.selfMute : undefined;
+    const recorder = await selfBotManager.startVoiceRecording({
+      guildId,
+      channelId,
+      durationSeconds,
+      leaveAfterStop,
+      selfMute,
+    });
+    res.json({ ok: true, recorder, state: selfBotManager.getPublicState() });
+  } catch (err) {
+    res.status(400).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Không thể bắt đầu ghi âm voice.',
+    });
+  }
+});
+
+app.post('/api/voice/record/stop', async (req, res) => {
+  try {
+    const forceLeave = typeof req.body?.forceLeave === 'boolean' ? req.body.forceLeave : undefined;
+    const clip = await selfBotManager.stopVoiceRecording(forceLeave);
+    res.json({ ok: true, clip, state: selfBotManager.getPublicState() });
+  } catch (err) {
+    res.status(400).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Không thể dừng ghi âm voice.',
+    });
+  }
+});
+
+app.get('/api/voice/recordings/:id/audio', (req, res) => {
+  const data = selfBotManager.getVoiceRecordingAudio(req.params.id);
+  if (!data) {
+    res.status(404).send('Recording not found');
+    return;
+  }
+  res.setHeader('Content-Type', 'audio/wav');
+  res.setHeader('Content-Disposition', `inline; filename="${data.filename}"`);
+  res.send(data.buffer);
+});
+
 app.get('/api/snipe', (_req, res) => {
   res.json({ ok: true, items: selfBotManager.getSnipedMessages() });
 });

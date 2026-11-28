@@ -36,6 +36,7 @@ export interface ActivityConfig {
   questBoostRatio: number;
   questAutoBackToVN: boolean;
   snipeWebhookUrl: string;
+  voiceWebhookUrl: string;
 }
 
 export interface RobloxLivePresence {
@@ -176,6 +177,37 @@ export interface SnipedMessagePublic {
   deletedAt: number;
 }
 
+export interface VoiceRecordingClipPublic {
+  id: string;
+  channelId: string;
+  channelName?: string;
+  guildId?: string;
+  guildName?: string;
+  startedAt: number;
+  endedAt: number;
+  durationSeconds: number;
+  sizeBytes: number;
+  speakers: Array<{ id: string; label: string }>;
+  webhookSent: boolean;
+  webhookError?: string;
+  audioRoute: string;
+}
+
+export interface VoiceRecorderPublicState {
+  recording: boolean;
+  status: 'idle' | 'connecting' | 'recording' | 'uploading';
+  channelId: string;
+  guildId: string;
+  startedAt: number | null;
+  elapsedSeconds: number;
+  targetDurationSeconds: number;
+  packetsCaptured: number;
+  activeSpeakers: string[];
+  estimatedBytes: number;
+  lastError: string | null;
+  recentRecordings: VoiceRecordingClipPublic[];
+}
+
 export interface BotPublicState {
   connectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
   hasToken: boolean;
@@ -200,4 +232,5 @@ export interface BotPublicState {
   badgeSpoof: BadgeSpoofPublicState;
   logs: LogEntry[];
   snipedMessages: SnipedMessagePublic[];
+  voiceRecorder: VoiceRecorderPublicState;
 }
