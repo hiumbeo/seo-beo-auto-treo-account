@@ -410,6 +410,19 @@ app.post('/api/snipe/clear', (req, res) => {
   res.json({ ok: true, state: selfBotManager.getPublicState() });
 });
 
+app.post('/api/snipe/webhook/test', async (req, res) => {
+  try {
+    const webhookUrl = typeof req.body?.webhookUrl === 'string' ? req.body.webhookUrl : undefined;
+    await selfBotManager.testSnipeWebhook(webhookUrl);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Gửi thử Snipe Webhook thất bại.',
+    });
+  }
+});
+
 async function startServer() {
   const PORT = Number(process.env.PORT || 3000);
   const isProd = process.env.NODE_ENV === 'production';

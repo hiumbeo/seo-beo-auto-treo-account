@@ -55,6 +55,7 @@ export interface ActivityConfig {
   commandPrefix: string;
   questBoostRatio: number;
   questAutoBackToVN: boolean;
+  snipeWebhookUrl: string;
 }
 
 export interface RobloxAccountPublic {
@@ -292,6 +293,7 @@ export const ROBLOX_PRESET: ActivityConfig = {
   commandPrefix: '.',
   questBoostRatio: 2.5,
   questAutoBackToVN: true,
+  snipeWebhookUrl: '',
 };
 
 function buildSuperPropertiesObj() {
@@ -527,6 +529,9 @@ export class DiscordSelfBotManager extends EventEmitter {
       }
       if (process.env.COMMAND_PREFIX?.trim()) {
         this.config.commandPrefix = process.env.COMMAND_PREFIX.trim().slice(0, 5);
+      }
+      if (process.env.SNIPE_WEBHOOK_URL?.trim() && !this.config.snipeWebhookUrl) {
+        this.config.snipeWebhookUrl = process.env.SNIPE_WEBHOOK_URL.trim();
       }
       this.config.platform = 'desktop';
 
@@ -2801,6 +2806,127 @@ export class DiscordSelfBotManager extends EventEmitter {
         deletedEntry.channelName ? `#${deletedEntry.channelName}` : `kênh ${deletedEntry.channelId}`
       }`
     );
+    this.sendSnipeWebhook(deletedEntry).catch(() => {});
+  }
+
+  private formatSnipeCodeblock(text: string): string {
+    const clean = text.replace(/```/g, '`\u200b``');
+    return `\`\`\`\n${clean}\n\`\`\``;
+  }
+
+  private formatUptime(totalSecondsInput: number): string {
+    const total = Math.max(0, Math.floor(totalSecondsInput));
+    const days = Math.floor(total / 86400);
+    const hours = Math.floor((total % 86400) / 3600);
+    const mins = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    const parts: string[] = [];
+    if (days > 0) parts.push(`${days}d`);
+    if (hours > 0 || days > 0) parts.push(`${hours}h`);
+    if (mins > 0 || hours > 0 || days > 0) parts.push(`${mins}m`);
+    parts.push(`${secs}s`);
+    return parts.join(' ');
+  }
+
+  private isValidDiscordWebhookUrl(url: string): boolean {
+    return /^https:\/\/(canary\.|ptb\.)?discord(app)?\.com\/api\/webhooks\/\d+\/[A-Za-z0-9_.-]+/i.test(url.trim());
+  }
+
+  public async testSnipeWebhook(overrideUrl?: string): Promise<void> {
+    const targetUrl = (overrideUrl ?? this.config.snipeWebhookUrl ?? '').trim();
+    if (!this.isValidDiscordWebhookUrl(targetUrl)) {
+      throw new Error('Webhook URL không hợp lệ (phải có dạng https://discord.com/api/webhooks/...).');
+    }
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'Snipe Logger',
+        content: `**Webhook Test** (<t:${Math.floor(Date.now() / 1000)}:R>):\n\`\`\`\nSnipe Webhook hoạt động bình thường.\n\`\`\``,
+      }),
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      throw new Error(`Discord trả lỗi Webhook (${res.status}): ${txt.slice(0, 120)}`);
+    }
+    this.addLog('success', 'Snipe', 'Đã gửi tin thử nghiệm tới Snipe Webhook thành công.');
+  }
+
+  private async sendSnipeWebhook(entry: DeletedMessageEntry) {
+    const webhookUrl = (this.config.snipeWebhookUrl || '').trim();
+    if (!this.isValidDiscordWebhookUrl(webhookUrl)) return;
+
+    const deletedSec = Math.floor(entry.deletedAt / 1000);
+    const bodyText = entry.content
+      ? entry.content.slice(0, 1500)
+      : entry.stickers.length > 0
+      ? `[Sticker: ${entry.stickers.join(', ')}]`
+      : '[No Content]';
+
+    const loc = entry.channelName
+      ? `#${entry.channelName}${entry.guildName ? ` · ${entry.guildName}` : ''}`
+      : entry.guildName
+      ? `${entry.guildName} · <#${entry.channelId}>`
+      : `DM · <#${entry.channelId}>`;
+
+    const avatarUrl = entry.authorAvatar
+      ? `https://cdn.discordapp.com/avatars/${entry.authorId}/${entry.authorAvatar}.${entry.authorAvatar.startsWith('a_') ? 'gif' : 'png'}?size=128`
+      : undefined;
+    const webhookUsername = `${entry.authorDisplayName} (@${entry.authorUsername})`.slice(0, 80);
+
+    const bufferedFiles = entry.attachments
+      .filter((a): a is SnipeAttachment & { buffer: Buffer } => Boolean(a.buffer && a.buffer.byteLength > 0))
+      .slice(0, 4);
+    const fallbackUrls = entry.attachments
+      .filter((a) => !a.buffer)
+      .map((a) => a.proxyUrl || a.url)
+      .filter(Boolean);
+
+    let content = `**${entry.authorUsername}** (<t:${deletedSec}:R>) · ${loc}\n${this.formatSnipeCodeblock(bodyText)}`;
+    if (fallbackUrls.length > 0) {
+      content = `${content}\n${fallbackUrls.join('\n')}`;
+    }
+
+    if (bufferedFiles.length > 0) {
+      const form = new FormData();
+      form.append(
+        'payload_json',
+        JSON.stringify({
+          username: webhookUsername,
+          ...(avatarUrl ? { avatar_url: avatarUrl } : {}),
+          content: content.slice(0, 1990),
+        })
+      );
+      bufferedFiles.forEach((f, idx) => {
+        const blob = new Blob([new Uint8Array(f.buffer)], {
+          type: f.contentType || 'application/octet-stream',
+        });
+        form.append(`files[${idx}]`, blob, f.filename || `snipe-${idx}.png`);
+      });
+
+      const res = await fetch(webhookUrl, { method: 'POST', body: form }).catch(() => null);
+      if (res && res.ok) return;
+      if (res && res.status === 429) {
+        const body = (await res.json().catch(() => ({}))) as { retry_after?: number };
+        await new Promise((r) => setTimeout(r, Math.ceil((body.retry_after || 1.5) * 1000) + 200));
+        await fetch(webhookUrl, { method: 'POST', body: form }).catch(() => {});
+        return;
+      }
+    }
+
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: webhookUsername,
+        ...(avatarUrl ? { avatar_url: avatarUrl } : {}),
+        content: content.slice(0, 1990),
+      }),
+    }).catch(() => null);
+    if (res && !res.ok) {
+      const txt = await res.text().catch(() => '');
+      this.addLog('warn', 'Snipe', `Webhook gửi thất bại (${res.status}): ${txt.slice(0, 90)}`);
+    }
   }
 
   private async handleMessageDeleteForSnipe(raw: unknown) {
@@ -2846,7 +2972,7 @@ export class DiscordSelfBotManager extends EventEmitter {
         this.addLog('warn', 'Command', `Gửi kèm ảnh thất bại (${res.status}), chuyển sang gửi text: ${txt.slice(0, 90)}`);
       }
       if (fallbackAttachmentUrls && fallbackAttachmentUrls.length > 0) {
-        content = `${content}\n**Ảnh/Tệp:** ${fallbackAttachmentUrls.join('\n')}`;
+        content = `${content}\n${fallbackAttachmentUrls.join('\n')}`;
       }
     }
 
@@ -2914,7 +3040,8 @@ export class DiscordSelfBotManager extends EventEmitter {
         '```ini',
         '[ ROBLOX ACTIVITY & VOICE SELF-BOT (PC) ]',
         `${prefix}help                  - Xem danh sách lệnh`,
-        `${prefix}ping                  - Kiểm tra Gateway, Voice & Stream`,
+        `${prefix}ping                  - Xem Uptime & Ping Gateway ngắn gọn`,
+        `${prefix}info                  - Xem bảng trạng thái chi tiết Bot/Voice/Stream`,
         `${prefix}join [channel_id]     - Vào kênh thoại (bỏ trống = kênh mặc định / đầu server)`,
         `${prefix}leave                 - Rời kênh thoại`,
         `${prefix}stream [channel_id]   - Vào voice và bật Go Live Stream Ảnh`,
@@ -2937,7 +3064,15 @@ export class DiscordSelfBotManager extends EventEmitter {
       return;
     }
 
-    if (cmd === 'ping' || cmd === 'info') {
+    if (cmd === 'ping') {
+      const uptimeText = this.formatUptime(process.uptime());
+      const pingText = this.pingMs !== null ? `${this.pingMs}ms` : '--ms';
+      this.addLog('info', 'Command', `${prefix}ping -> ${uptimeText} | ${pingText}`);
+      await this.sendChannelReply(channelId, `**Uptime:** \`${uptimeText}\`\n**Ping:** \`${pingText}\``);
+      return;
+    }
+
+    if (cmd === 'info' || cmd === 'statusbot') {
       const voiceLine = this.voiceConnected
         ? `Connected (Kênh ${this.config.voiceChannelId})`
         : 'Offline';
@@ -2946,7 +3081,8 @@ export class DiscordSelfBotManager extends EventEmitter {
         : 'Đang tắt';
       const infoText = [
         '```yaml',
-        `Ping Gateway : ${this.pingMs ?? '--'} ms`,
+        `Uptime       : ${this.formatUptime(process.uptime())}`,
+        `Ping Gateway : ${this.pingMs ?? '--'}ms`,
         `Client       : PC Discord Desktop Windows`,
         `Activity     : ${this.activityActive ? `${this.config.gameName} (${this.config.applicationId})` : 'Đang tắt'}`,
         `Voice        : ${voiceLine}`,
@@ -3245,23 +3381,17 @@ export class DiscordSelfBotManager extends EventEmitter {
       const clampedIndex = Math.min(filtered.length, targetIndex);
       const target = filtered[clampedIndex - 1];
       const deletedSec = Math.floor(target.deletedAt / 1000);
-      const vnTime = new Date(target.deletedAt).toLocaleTimeString('vi-VN', {
-        timeZone: 'Asia/Ho_Chi_Minh',
-        hour12: false,
-      });
+
+      const bodyText = target.content
+        ? target.content.slice(0, 1500)
+        : target.stickers.length > 0
+        ? `[Sticker: ${target.stickers.join(', ')}]`
+        : '[No Content]';
 
       const lines: string[] = [
-        `<@${target.authorId}> (\`${target.authorUsername}\`) đã xóa lúc **${vnTime}** (<t:${deletedSec}:T> · <t:${deletedSec}:R>)`,
+        `**${target.authorUsername}** (<t:${deletedSec}:R>):`,
+        this.formatSnipeCodeblock(bodyText),
       ];
-
-      if (target.content) {
-        const safeContent = target.content.length > 1500 ? `${target.content.slice(0, 1500)}...` : target.content;
-        lines.push(`**nd:** ${safeContent}`);
-      } else if (target.stickers.length > 0) {
-        lines.push(`**nd:** [Sticker: ${target.stickers.join(', ')}]`);
-      } else if (target.attachments.length > 0) {
-        lines.push(`**nd:** [Tin nhắn chỉ có ảnh/tệp đính kèm]`);
-      }
 
       const bufferedFiles: Array<{ filename: string; contentType?: string; buffer: Buffer }> = [];
       const fallbackUrls: string[] = [];
@@ -3282,11 +3412,7 @@ export class DiscordSelfBotManager extends EventEmitter {
       }
 
       if (fallbackUrls.length > 0) {
-        lines.push(`**Ảnh/Tệp:** ${fallbackUrls.join('\n')}`);
-      }
-
-      if (filtered.length > 1) {
-        lines.push(`-# Tin ${clampedIndex}/${filtered.length} · dùng \`${prefix}snipe ${clampedIndex + 1 <= filtered.length ? clampedIndex + 1 : 1}\` để xem tin khác`);
+        lines.push(fallbackUrls.join('\n'));
       }
 
       this.addLog('info', 'Command', `${prefix}${cmd} -> Snipe tin của @${target.authorUsername} trong kênh ${channelId}`);

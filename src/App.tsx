@@ -395,6 +395,21 @@ export default function App() {
     }
   };
 
+  const handleTestSnipeWebhook = async (webhookUrl: string) => {
+    setErrorMsg(null);
+    const res = await fetch('/api/snipe/webhook/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ webhookUrl }),
+    });
+    const json = await res.json();
+    if (!res.ok || !json.ok) {
+      setErrorMsg(json.error || 'Gửi thử Snipe Webhook thất bại.');
+      return;
+    }
+    notify('Đã gửi tin nhắn thử nghiệm tới Snipe Webhook.');
+  };
+
   const connMeta = state
     ? CONNECTION_LABELS[state.connectionState]
     : CONNECTION_LABELS.disconnected;
@@ -975,6 +990,9 @@ export default function App() {
             <SnipeTab
               snipedMessages={state.snipedMessages || []}
               gatewayConnected={state.connectionState === 'connected'}
+              webhookUrl={state.config.snipeWebhookUrl || ''}
+              onUpdateWebhook={(url) => handleUpdateConfig({ snipeWebhookUrl: url })}
+              onTestWebhook={handleTestSnipeWebhook}
               onClearSnipe={handleClearSnipe}
             />
           )}

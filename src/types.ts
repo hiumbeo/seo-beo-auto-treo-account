@@ -35,6 +35,7 @@ export interface ActivityConfig {
   commandPrefix: string;
   questBoostRatio: number;
   questAutoBackToVN: boolean;
+  snipeWebhookUrl: string;
 }
 
 export interface RobloxLivePresence {

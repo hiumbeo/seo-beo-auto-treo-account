@@ -1,12 +1,15 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
+  Check,
   Clock,
   ExternalLink,
   Hash,
   Image as ImageIcon,
   Paperclip,
   Search,
+  Send,
   Trash2,
+  Webhook,
   X,
 } from 'lucide-react';
 import type { SnipedMessagePublic } from '../types';
@@ -14,6 +17,9 @@ import type { SnipedMessagePublic } from '../types';
 interface SnipeTabProps {
   snipedMessages: SnipedMessagePublic[];
   gatewayConnected: boolean;
+  webhookUrl: string;
+  onUpdateWebhook: (url: string) => Promise<void>;
+  onTestWebhook: (url: string) => Promise<void>;
   onClearSnipe: (channelId?: string) => Promise<void>;
 }
 
@@ -28,12 +34,27 @@ function formatRelativeVi(timestampMs: number): string {
   return `${diffDay} ngày trước`;
 }
 
-export function SnipeTab({ snipedMessages, gatewayConnected, onClearSnipe }: SnipeTabProps) {
+export function SnipeTab({
+  snipedMessages,
+  gatewayConnected,
+  webhookUrl,
+  onUpdateWebhook,
+  onTestWebhook,
+  onClearSnipe,
+}: SnipeTabProps) {
   const [viewMode, setViewMode] = useState<'latest_per_channel' | 'all'>('latest_per_channel');
   const [searchQuery, setSearchQuery] = useState('');
   const [onlyImages, setOnlyImages] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+
+  const [webhookInput, setWebhookInput] = useState(webhookUrl);
+  const [savingWebhook, setSavingWebhook] = useState(false);
+  const [testingWebhook, setTestingWebhook] = useState(false);
+
+  useEffect(() => {
+    setWebhookInput(webhookUrl);
+  }, [webhookUrl]);
 
   const channelCount = useMemo(() => {
     return new Set(snipedMessages.map((m) => m.channelId)).size;
@@ -87,6 +108,24 @@ export function SnipeTab({ snipedMessages, gatewayConnected, onClearSnipe }: Sni
     }
   };
 
+  const handleSaveWebhook = async () => {
+    setSavingWebhook(true);
+    try {
+      await onUpdateWebhook(webhookInput.trim());
+    } finally {
+      setSavingWebhook(false);
+    }
+  };
+
+  const handleTestWebhook = async () => {
+    setTestingWebhook(true);
+    try {
+      await onTestWebhook(webhookInput.trim());
+    } finally {
+      setTestingWebhook(false);
+    }
+  };
+
   return (
     <div className="space-y-5">
       <div className="grid grid-cols-1 sm:grid-cols-3 border border-[#232C3F] rounded-lg bg-[#111622] divide-y sm:divide-y-0 sm:divide-x divide-[#232C3F]">
@@ -112,6 +151,52 @@ export function SnipeTab({ snipedMessages, gatewayConnected, onClearSnipe }: Sni
             {imageMessageCount} tin
           </div>
           <div className="text-xs text-slate-500 mt-0.5">Ảnh được tải sẵn vào RAM trước khi CDN xóa</div>
+        </div>
+      </div>
+
+      <div className="bg-[#111622] border border-[#232C3F] rounded-lg p-5 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Webhook className="w-4 h-4 text-[#5865F2]" />
+            <h3 className="text-sm font-semibold text-white">Snipe Webhook Logger (Tự động gửi về kênh riêng)</h3>
+          </div>
+          <span className={`text-xs font-medium ${webhookUrl ? 'text-emerald-400' : 'text-slate-500'}`}>
+            {webhookUrl ? 'Đang bật tự động gửi' : 'Chưa gắn Webhook'}
+          </span>
+        </div>
+
+        <p className="text-xs text-slate-400">
+          Mỗi khi có người xóa tin nhắn hoặc ảnh trong bất kỳ server/DM nào, bot tự đẩy bản lưu (kèm file ảnh gốc) về Webhook Discord của bạn (hoặc set biến môi trường <span className="font-mono text-slate-300">SNIPE_WEBHOOK_URL</span> trên Render).
+        </p>
+
+        <div className="flex flex-col sm:flex-row gap-2.5">
+          <input
+            type="text"
+            value={webhookInput}
+            onChange={(e) => setWebhookInput(e.target.value)}
+            placeholder="https://discord.com/api/webhooks/..."
+            className="flex-1 bg-[#090C12] border border-[#232C3F] focus:border-[#5865F2] rounded-md px-3 py-2 text-xs font-mono text-white placeholder:text-slate-600 outline-none"
+          />
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={savingWebhook}
+              onClick={handleSaveWebhook}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-[#5865F2] hover:bg-[#4752C4] disabled:opacity-50 text-white rounded-md transition-colors"
+            >
+              <Check className="w-3.5 h-3.5" />
+              {savingWebhook ? 'Đang lưu...' : 'Lưu Webhook'}
+            </button>
+            <button
+              type="button"
+              disabled={testingWebhook || !webhookInput.trim()}
+              onClick={handleTestWebhook}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium bg-[#182032] hover:bg-[#222D45] border border-[#2C374F] disabled:opacity-50 text-slate-200 rounded-md transition-colors"
+            >
+              <Send className="w-3.5 h-3.5" />
+              {testingWebhook ? 'Đang gửi...' : 'Test'}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -279,17 +364,13 @@ export function SnipeTab({ snipedMessages, gatewayConnected, onClearSnipe }: Sni
                     </div>
                   </div>
 
-                  {item.content && (
-                    <div className="bg-[#111622] border border-[#232C3F] rounded-md px-3.5 py-2.5 text-sm text-slate-100 whitespace-pre-wrap break-words leading-relaxed">
-                      {item.content}
-                    </div>
-                  )}
-
-                  {item.stickers.length > 0 && (
-                    <div className="text-xs text-slate-300 font-mono">
-                      [Sticker: {item.stickers.join(', ')}]
-                    </div>
-                  )}
+                  <div className="bg-[#111622] border border-[#232C3F] rounded-md px-3.5 py-2 text-xs font-mono text-slate-200 whitespace-pre-wrap break-words leading-relaxed">
+                    {item.content
+                      ? item.content
+                      : item.stickers.length > 0
+                      ? `[Sticker: ${item.stickers.join(', ')}]`
+                      : '[No Content]'}
+                  </div>
 
                   {imageAtts.length > 0 && (
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
